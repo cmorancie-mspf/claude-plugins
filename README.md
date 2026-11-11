@@ -7,7 +7,7 @@ Plugins for engineering work done as planned, proven steps. One marketplace; ins
 Add the marketplace once:
 
 ```
-claude plugin marketplace add cmorancie-mspf/claude-plugins
+claude plugin marketplace add production-ai-eng/claude-plugins
 ```
 
 Then install a plugin by name:
@@ -16,7 +16,7 @@ Then install a plugin by name:
 claude plugin install rebuild-factory@production-ai
 ```
 
-From a local copy of this repository, give the folder's path in place of `cmorancie-mspf/claude-plugins`.
+From a local copy of this repository, give the folder's path in place of `production-ai-eng/claude-plugins`.
 
 ## Plugins
 

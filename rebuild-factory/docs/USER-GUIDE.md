@@ -37,11 +37,11 @@ You talk to the conductor. The conductor talks to the builder. You never copy te
 ### Install, once per machine
 
 ```
-claude plugin marketplace add cmorancie-mspf/claude-plugins
+claude plugin marketplace add production-ai-eng/claude-plugins
 claude plugin install rebuild-factory@production-ai
 ```
 
-If you were given the folder instead of the address, put the folder's path in place of `cmorancie-mspf/claude-plugins`.
+If you were given the folder instead of the address, put the folder's path in place of `production-ai-eng/claude-plugins`.
 
 Open a new Claude Code chat afterwards. Type `/mcp` and check that `oc-bridge` is listed: that is the part that drives the builder.
 
