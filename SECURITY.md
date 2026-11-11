@@ -13,4 +13,3 @@ Please report a security problem privately, not in a public issue: use **Report 
 ## In scope
 
 A way for a plugin to run a command its rules file should refuse; a way for repository content under audit to make a plugin take an action the owner did not ask for; a secret written to a log, a prompt or a committed file.
-
