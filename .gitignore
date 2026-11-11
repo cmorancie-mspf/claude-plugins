@@ -3,6 +3,7 @@ node_modules/
 Thumbs.db
 *.log
 *.bak
-factory-plan/
+# a project's own plan folder, at the root only: a plugin has a skill folder of the same name
+/factory-plan/
 __pycache__/
 *.pyc

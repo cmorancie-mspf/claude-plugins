@@ -72,6 +72,14 @@ for (const f of files.filter((x) => /\.(mjs|cjs|js)$/.test(x))) {
   catch (e) { bad(`${rel(f)}: does not parse: ${String(e.stderr || e.message).split('\n')[0]}`); }
 }
 
+// Nothing inside a plugin may be hidden by an ignore rule: an ignored file is never published,
+// and the checks above would still find it on disk and pass.
+try {
+  const ignored = execFileSync('git', ['-C', root, 'ls-files', '--others', '--ignored', '--exclude-standard', '--', ...plugins.map((p) => path.relative(root, p))], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    .split(/\r?\n/).filter((f) => f && !/(^|\/)(__pycache__|node_modules)\//.test(f) && !/\.(pyc|log|bak)$/.test(f));
+  for (const f of ignored) bad(`${f}: is ignored by git, so it would not be published`);
+} catch { /* not a git checkout: nothing to compare */ }
+
 // Nothing that belongs to one machine or one person.
 const machine = [/\b[A-Za-z]:\\\\?(Users|MSPF)\b/, /\/Users\/[a-z]/, /\/home\/[a-z]/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\b(ghp|gho|github_pat|sk-ant|sk-proj|xox[baprs])[-_][A-Za-z0-9_-]{16,}/];
 for (const f of files.filter((x) => /\.(md|json|mjs|cjs|js|yml|yaml|txt)$/.test(x) && !x.endsWith(path.join('.github', 'check.mjs')))) {
