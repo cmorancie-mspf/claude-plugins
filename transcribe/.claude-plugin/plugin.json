@@ -1,0 +1,16 @@
+{
+  "name": "transcribe",
+  "description": "Turn a local audio or video file, or a URL, into a text transcript, processed on your own machine with faster-whisper. No API key, and the audio is not sent to any speech service. Timestamped lines, plain text or SubRip subtitles.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Chris Morancie"
+  },
+  "license": "MIT",
+  "keywords": [
+    "transcription",
+    "whisper",
+    "speech-to-text",
+    "subtitles",
+    "local"
+  ]
+}

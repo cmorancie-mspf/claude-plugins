@@ -14,6 +14,7 @@ Then install a plugin by name:
 
 ```
 claude plugin install rebuild-factory@production-ai
+claude plugin install transcribe@production-ai
 ```
 
 From a local copy of this repository, give the folder's path in place of `production-ai-eng/claude-plugins`.
@@ -23,6 +24,7 @@ From a local copy of this repository, give the folder's path in place of `produc
 | Plugin | What it is for | Status |
 |---|---|---|
 | [rebuild-factory](rebuild-factory/README.md) | Audit an existing codebase, write a plan a cheaper model can build from, and run the rebuild as a loop in which each small session is reproduced from a clean clone and attacked before it is merged | Early: see its notice |
+| [transcribe](transcribe/README.md) | Turn an audio or video file, or a URL, into a transcript, processed on your own machine. No API key; the audio is not sent to any speech service | In regular use on Windows; untried on macOS and Linux |
 
 ### rebuild-factory
 
@@ -53,6 +55,10 @@ Requires Node 20 or later and git; the build stage also needs [OpenCode](https:/
 - **Guide for owners:** [rebuild-factory/docs/USER-GUIDE.md](rebuild-factory/docs/USER-GUIDE.md)
 - **What ships, and the method:** [rebuild-factory/README.md](rebuild-factory/README.md)
 - **The OpenCode bridge alone, and how to support another builder tool:** [rebuild-factory/bridge/README.md](rebuild-factory/bridge/README.md)
+
+### transcribe
+
+Say "transcribe <file or URL>" in any chat. See [its README](transcribe/README.md). Requires Python 3.9 or later; on first use it checks what is missing and installs the packages only when you agree. The first run downloads a speech model of 0.5 to 3 GB.
 
 ## Layout of this repository
 

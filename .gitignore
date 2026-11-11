@@ -4,3 +4,5 @@ Thumbs.db
 *.log
 *.bak
 factory-plan/
+__pycache__/
+*.pyc

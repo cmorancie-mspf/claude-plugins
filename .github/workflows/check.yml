@@ -19,3 +19,5 @@ jobs:
           node-version: 20
       - name: Manifests, frontmatter, scripts, no machine paths
         run: node .github/check.mjs
+      - name: Python scripts parse
+        run: python3 -m compileall -q -x "node_modules" .
