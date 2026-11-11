@@ -30,7 +30,7 @@ You talk to the conductor. The conductor talks to the builder. You never copy te
 
 - **Claude Code**, with this plugin installed (below).
 - **Node 20 or later**, and **git**.
-- **OpenCode**, installed and signed in (see "Set up the builder" below). Only the build stage needs it; the audit, direction, plan and plan review run in Claude Code alone.
+- **OpenCode 2 or later**, installed and signed in (see "Set up the builder" below). Only the build stage needs it; the audit, direction, plan and plan review run in Claude Code alone.
 - **A git repository** with a clean working tree.
 - **Free memory.** One builder, one conductor and a review use a few gigabytes. Close what you do not need. On a machine with 16 GB, memory is what limits the loop.
 
@@ -62,13 +62,38 @@ The bridge starts OpenCode; it does not sign in for you and holds no credentials
 
 Use a model on a provider you pay for. Free tiers run out part-way through a session.
 
+### What installing does, and does not do
+
+Installing the plugin copies its skills, agents, script and bridge. It does **not** install Node, git or OpenCode, and it does not sign OpenCode in.
+
+You do not have to verify any of that by hand. `/rebuild-factory` runs a readiness check and tells you, in plain words, what is missing and how to fix it. The check calls no model and costs nothing. It looks at:
+
+| Check | Fails when |
+|---|---|
+| Node and git | Missing, or Node older than 20 |
+| The builder tool | OpenCode is not installed |
+| The builder tool's options | OpenCode is older than version 2 |
+| The builder's models | OpenCode lists none. **A working sign-in is not checked**: run the one-line test above |
+| The plan folder | It was not set up or accepted on this machine |
+| The builder's model | The model in your settings is not one OpenCode offers |
+| The builder's rules file | It is missing, refuses nothing, or lets a plain `git push` through. It warns when other sample commands get through, or when ordinary commands are caught |
+| The starting tag | The commit the rebuild starts from is not tagged |
+| The working tree | Uncommitted changes, before the build stage |
+| Free memory, worktree path | Warnings only |
+
+"Ready" means these checks passed. It does not mean a builder run is safe; see "Safety, plainly".
+
+The audit, direction, plan and plan review need only Node and git. The builder checks matter before the build stage, and the conductor will not start a builder while one of them fails.
+
+To run it yourself: ask any chat on the repository "is the factory ready?".
+
 ## The commands
 
 Type each in a Claude Code chat opened on the repository. They run in this order.
 
 ### 1. `/rebuild-factory`: set up
 
-Creates a folder called `factory-plan/` in the repository, keeps it out of git, and writes a settings file. It also tags the commit you are starting from.
+Tags the commit you are starting from, with your agreement. Creates a folder called `factory-plan/` in the repository, keeps it out of git, and writes a settings file and a rules file for the builder.
 
 It then asks for the settings one at a time, each with a recommendation. You can change any of them later with `/factory-config`.
 
@@ -141,7 +166,7 @@ Then it goes straight to the next session.
 
 Open `factory-plan/handback/PROGRESS.md`. After every session the conductor adds a few lines in plain language: the verdict, what exists now that did not, what the review found, any ruling it made that you may overturn, and what changes for later sessions.
 
-To see what the builder is doing at this moment, ask the conductor chat ("what is the builder doing?") or open the live log at `<your home folder>/.oc-bridge/runs/<project>-<session>/log.txt`.
+To see what the builder is doing at this moment, ask the conductor chat ("what is the builder doing?") or open the live log at `<your home folder>/.oc-bridge/runs/<run id>/log.txt` (the conductor tells you the run id; it is the project name, a short code for the repository, and the session).
 
 To ask why the builder did something after a session, ask any Claude chat: "in the run for session X, why did the builder do Y?" It reads the log. If you want the builder's reasoning in the log as well as its actions, tell the conductor to start runs with thinking on.
 
@@ -218,11 +243,27 @@ A sensible split: your strongest model for the chats that run the audit, the pla
 
 ## Safety, plainly
 
-- The builder runs with its commands auto-approved; nobody watches each one. Its rules file refuses pushes and common deploy commands. **Edit that file for your project's own deploy commands before the first session.**
-- The rules file matches command text. It stops the obvious and is not a sandbox. The clean-copy review is what catches the rest.
+- **The builder runs with its commands auto-approved; nobody watches each one.**
+- **Its rules file** is `factory-plan/builder-rules.json`. It refuses the plain forms of `git push` and of common publish and deploy commands by matching command text. A different spelling, a script that deploys from inside, or another tool gets through. It is not a sandbox. Add your project's own deploy and publish commands to it before the first session. The readiness check tries sample commands against it and tells you which get through.
+- **The control that actually holds is where the builder runs: no production credentials in reach, and a remote its credentials cannot write to.** If the machine can deploy to production, assume the builder can.
+- **The builder is told not to edit the plan or tag its own work, and two checks notice if it does.** The plan folder is recorded before each builder turn and compared after it, and a session counts as accepted only when the conductor has recorded it after its review. Those records are kept in your home folder (`.rebuild-factory`), not in the repository. These catch a builder that is stuck and takes a shortcut. They do not stop a determined one: the builder runs as you.
+- **Edit the rules file by adding deny lines only.** It must stay in one shape: `"*": "allow"` first, then denies. The tools refuse a file with an allow anywhere else, or with anything besides permissions in it, because either could quietly switch a refusal off.
+- **The rules sometimes refuse harmless commands.** They match text, so a commit message or a file name that contains the words of a refused command is refused too. The builder is told to do the work another way and to say so. If it happens often on your project, narrow the rule in `builder-rules.json`.
+- **If your repository has its own `opencode.json` or `.opencode` folder, the bridge will not start a builder in it.** Such a file can override the rules. The conductor shows it to you and you decide.
+- **The review catches weak tests, work outside scope and a changed plan.** It cannot undo a push, a deploy or a deleted file that already happened.
+- **The audit and every review run the repository's code on your machine**: its tests and its install step. Do not point this at code you would not run.
+- **A repository that arrives with its own `factory-plan/` folder is not believed.** The helper script refuses it until you have been shown the commands it would run and have said yes.
 - Secrets found by the audit are reported by where they are, never printed. Rotating them is yours.
-- Nothing is deployed by any stage.
+- No stage is told to deploy, push or spend. Whether a builder can depends on the points above.
 - The plan folder is kept out of git by default, because an audit can name things that should not be published.
+
+## Permissions the loop needs
+
+For the build stage to run without stopping at every step, the conductor chat needs to be allowed, in this project: the `oc-bridge` tools, `git`, `node`, your install and test commands, and background shell commands. Grant them for the project, not for every project.
+
+Know what that opens. Once `opencode_start` is allowed without a prompt, a Claude chat in that project can start an auto-approved coding agent. The bridge refuses to start one without a rules file, but the rules file is the limit described under "Safety, plainly", no more.
+
+For the audit and the plan stages, keep the normal permission prompts on: those stages read a codebase you do not trust yet.
 
 ## When something goes wrong
 
@@ -232,6 +273,10 @@ A sensible split: your strongest model for the chats that run the audit, the pla
 | The conductor chat restarted | The chat's process ended | Type `/factory-conduct`. The builder was not affected. |
 | A session keeps failing review | The tests do not hold the behaviour, or the plan has a gap | Read the latest `REVIEW.md` in that session's handback folder; the findings are specific |
 | The builder's turn keeps ending without a handback | It ran out of turn, often waiting on a background command | The conductor recovers it and tells it what is still owed; raise the limit if it is making progress |
+| The script says the plan folder "was not set up on this machine" | The folder came with the repository, or its commands or rules changed outside the tool | Ask the conductor to show you what it holds; say yes only after reading the commands |
+| The conductor reports the plan folder changed during a build | The builder wrote somewhere it was told not to | Read which file; the conductor restores it and sends the session back |
+| The conductor reports a tag that was not recorded | The builder tagged its own work, or the earlier sessions were accepted on another machine | It does not count until recorded; the conductor tells you which it is |
+| The bridge says the folder "has its own OpenCode config" | The repository holds an `opencode.json` or `.opencode`, or the builder created one | Read it. Remove it, or tell the conductor to allow it |
 | `oc-bridge` is not listed under `/mcp` | The plugin's bridge did not load | Reload the window; check Node is on the path |
 | Odd failures in a review that the builder did not see | The review copy is at a long path | Set `worktree_root` to a short path |
 
@@ -248,4 +293,4 @@ A sensible split: your strongest model for the chats that run the audit, the pla
 
 ## A note on maturity
 
-The method was drawn from one rebuild that ran this way from audit to build. The helper script and the bridge are tested. The skills and agents have not yet been run on a second codebase, so expect to adjust them the first time, and change the plugin's reference files when you do, not your project.
+The method was drawn from one rebuild that ran this way from audit to build. The helper script and the bridge have been exercised by tests and by an independent red team, on Windows only. The skills and agents have not yet been run on a second codebase, so expect to adjust them the first time, and change the plugin's reference files when you do, not your project.

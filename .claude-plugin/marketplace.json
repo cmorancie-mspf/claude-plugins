@@ -10,7 +10,7 @@
     {
       "name": "rebuild-factory",
       "source": "./rebuild-factory",
-      "description": "Audit, plan and rebuild an existing codebase with a builder you do not have to trust. Five stages, each a skill that writes into one plan folder: a red-team and claims-versus-code audit with numbered findings; the owner's direction; a plan with requirement ids, small sessions, plan-owned fixtures, one phase command and mutation checks; an independent plan review; and a conductor loop that starts a separate coding agent per session through a bundled bridge, reviews its work from a clean clone by breaking things on purpose, merges on a pass and sends findings back on a fail. Ships five agents, a helper script, templates, and the OpenCode bridge as an MCP server. Parameterised per project by a config file; nothing in it is specific to one product."
+      "description": "Audit, plan and rebuild an existing codebase with a builder whose reports are never taken on trust. Five stages, each a skill that writes into one plan folder: a red-team and claims-versus-code audit with numbered findings; the owner's direction; a plan with requirement ids, small sessions, plan-owned fixtures, one phase command and mutation checks; an independent plan review; and a conductor loop that starts a separate coding agent per session through a bundled bridge, reviews its work from a clean clone by breaking things on purpose, merges on a pass and sends findings back on a fail. Ships five agents, a helper script, templates, and the OpenCode bridge as an MCP server. Parameterised per project by a config file; nothing in it is specific to one product."
     },
     {
       "name": "transcribe",

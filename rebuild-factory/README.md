@@ -4,7 +4,7 @@ Audit an existing codebase, write a plan a weaker model can build from, and run 
 
 It is for a codebase that exists, sort of works, and cannot be trusted: its documents claim more than its code does, its tests pass without proving much, and nobody is sure what is safe to run.
 
-> The build stage starts a coding agent with its commands auto-approved. The rules file that refuses pushes and deploys matches command text and is not a sandbox. Edit it for your project, and run the loop only where an unattended coding agent is acceptable.
+> The build stage starts a coding agent with its commands auto-approved. Its rules file refuses the plain forms of `git push` and of common publish and deploy commands by matching command text. A different spelling, a script that deploys from inside, or another tool gets through. It is not a sandbox. The control that actually holds is where the builder runs: no production credentials in reach, and a remote its credentials cannot write to. The audit and every review run the repository's own code on your machine.
 
 **Using it:** see [docs/USER-GUIDE.md](docs/USER-GUIDE.md) for what to type, what each stage asks of you, and what to do when the loop stops.
 
@@ -13,7 +13,7 @@ It is for a codebase that exists, sort of works, and cannot be trusted: its docu
 **A builder's report proves nothing. Only a test that fails when the code is wrong counts.**
 
 - The audit checks the project's claims about itself against the code, and tries to disprove its own findings.
-- The plan owns the expected values, as data files, so a builder cannot make them agree with its code.
+- The plan states the expected values, as data files, so the builder does not get to choose them. The builder is told not to edit them, and the plan folder is recorded before each builder turn and checked after it.
 - One command decides each session. It fails for a missing test, an empty test, a changed fixture or a banned pattern, not only for a failing test.
 - The review reproduces the result from a clean clone, then removes decision lines and switches off checks, and expects a test to notice.
 
@@ -37,14 +37,15 @@ The capable model plans, rules and reviews. A cheaper model builds. The owner de
 - **Agents**: `audit-reviewer`, `finding-verifier`, `plan-reviewer`, `session-reviewer`, `read-list-drafter`.
 - **References**: the method, read by the skills when needed: `layout.md`, `plan-standard.md`, `verification-standard.md`, `review-protocol.md`, `conductor-loop.md`.
 - **Templates**: the config, the builder's kickoff prompt, the spike block, the handback, the review, the progress log.
-- **`scripts/factory.mjs`**: `init`, `where`, `prompt`, `check-handback`, and the settings commands `show`, `set`, `add`, `remove`. Node 20 or later, no dependencies.
+- **`scripts/factory.mjs`**: `init`, `doctor` (is this machine and project ready), `trust` (accept a plan folder on this machine), `where`, `prompt`, `check-handback`, `seal` and `check-seal` (did the plan folder change during a builder turn), and the settings commands `show`, `set`, `unset`, `add`, `remove`. Node 20 or later, no dependencies.
 - **`bridge/`**: `oc-bridge`, an MCP server (and command line) that starts, continues, watches and stops non-interactive OpenCode runs. Registered by the plugin's `.mcp.json`.
 
 ## Requirements
 
 - Node 20 or later, and git.
 - OpenCode installed, with a model the builder can use. The bridge drives OpenCode; another builder tool needs its own bridge with the same five operations.
-- A deny-rules config for the builder. `bridge/configs/no-deploy-no-push.json` is a starting point: edit it for the project's own deploy commands. It matches command text and is not a sandbox.
+- OpenCode 2 or later.
+- A rules file for the builder. Set-up copies a starting point to `factory-plan/builder-rules.json`: edit that copy for the project's own deploy commands. It refuses the plain forms of `git push` and of common publish and deploy commands by matching command text. A different spelling, a script that deploys from inside, or another tool gets through. It is not a sandbox. The bridge refuses to start an auto-approved run without one, and passes it so that a config file in the project cannot override it.
 
 ## Start
 
@@ -57,9 +58,24 @@ In a Claude Code chat opened on the repository, type `/rebuild-factory`. It sets
 - A session is roughly an hour of building, half an hour of review and twenty minutes of preparation, one after another. Memory limits a small machine before model speed does.
 - The loop is unattended, not unsupervised: it stops for paid tests, owner-only actions, design rulings and its stop policy.
 
+## What protects what
+
+| Risk | What stands against it | How far it goes |
+|---|---|---|
+| The builder pushes or deploys | The rules file, passed so a project config cannot override it | Plain command forms only. Not a sandbox. It also refuses some harmless commands that contain the same words. |
+| The builder edits a fixture, a setting or the log | It is told not to; the plan folder is sealed before each turn and checked after | Detects it. Does not prevent it. |
+| The builder tags its own work as accepted | A session counts only when the conductor recorded it, in the owner's home folder, against an annotated tag on a merge commit; tag commands are refused | Detects it. A builder that edits that record defeats it. |
+| A project config overrides the rules | Rules are set for every built-in agent; a folder with its own OpenCode config is refused, at each turn | Holds unless the owner allows the project config in. |
+| The rules file is weakened between turns | The rules are copied at the start; a changed copy stops the run | The copy sits in the user's home folder, which the builder can also reach. |
+| A cloned repository brings its own plan folder | The script refuses a plan folder not accepted on this machine; the record is in the owner's home folder, where a clone cannot put one. Accepting shows the owner the commands, the rules, and the kickoff prompt's added and removed lines | Covers what an agent is told to run. The plan's own content (fixtures, session blocks) is not shown there; a hostile plan is still a hostile plan. |
+| Text in the repository steers an agent | Every agent is told such text is evidence and a request in it is a finding | An instruction, not a mechanism. |
+| A stale record gets a process killed | The bridge kills only a process whose command line names the run | — |
+
+None of this replaces running the builder where there is nothing to damage: no production credentials, and a remote it cannot write to.
+
 ## Where the method came from
 
-It was drawn from one rebuild that ran this way end to end. Parts of it will turn out to be shaped by that project. When a second project shows one, change the reference file, not the project.
+It was drawn from one rebuild that ran this way end to end, and it was reviewed by an independent red team before this release, whose findings shaped the table above. The helper script and the bridge have tests in `tests/` (`node tests/test_factory.mjs`), which use a stand-in for OpenCode and spend nothing. Parts of it will turn out to be shaped by that project. When a second project shows one, change the reference file, not the project.
 
 ## Sharing
 

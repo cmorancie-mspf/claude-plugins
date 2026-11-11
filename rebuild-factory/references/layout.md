@@ -5,7 +5,7 @@ Every stage reads and writes one folder, the plan folder. Its default place is `
 ## Why it is not committed by default
 
 - A review runs in a clean clone. If the plan is not in the clone, nothing the builder wrote can depend on it, and a test that only passes with the plan beside it fails where it should.
-- The builder may read the plan and may not edit it. A folder outside the worktree makes that a fact: a worktree holds tracked files only.
+- The builder is told to read the plan and not to edit it, and is given one place to write: `handback/<session>/`. Keeping the folder outside the worktree means a builder does not change it by accident. It does not make changing it impossible: it is an ordinary folder the builder can write to. The conductor therefore records the folder before each builder turn (`factory.mjs seal`) and checks it afterwards (`check-seal`).
 - A plan often names things that must not be published: findings about live credentials, private repositories, the owner's machine.
 
 Set `plan_committed` to true in the config only when the owner wants the plan in the repository. The review then compares the committed fixtures with the plan's copy as before, and the builder's prompt forbids edits under the plan folder.
@@ -15,6 +15,7 @@ Set `plan_committed` to true in the config only when the owner wants the plan in
 ```
 factory-plan/
   factory.config.json        the project's settings (see below)
+  builder-rules.json         the commands the builder is refused; edit it for the project
   audit/
     AUDIT-REPORT.md          the findings, numbered, with the ship answer
     reviewers/<lens>.md      each reviewer's own report, written as it works
@@ -51,7 +52,7 @@ factory-plan/
 | `main_branch` | The branch accepted sessions are merged to. |
 | `worktree_root` | Where session worktrees and review clones go. Keep it short: a deep path breaks tools on Windows. |
 | `branch_prefix`, `tag_prefix` | A session `S` is built on `<branch_prefix>S` and accepted as `<tag_prefix>S`. |
-| `builder.model`, `builder.config` | The model the builder runs on, and the builder tool's config file holding the deny rules. |
+| `builder.model`, `builder.config` | The model the builder runs on, and the rules file: the builder tool's config holding the deny rules. `init` writes the project's own copy to `builder-rules.json` in the plan folder. It can never be empty. |
 | `builder.thinking` | Whether the builder's reasoning is written to its log. |
 | `models.*` | The model each helper agent runs on: `audit_reviewer`, `finding_verifier`, `plan_reviewer`, `session_reviewer`, `read_list_drafter`. Empty means the model of the chat that starts it. |
 | `commands.install` | What a clean clone needs before anything runs, for example `npm ci`. |
@@ -59,6 +60,14 @@ factory-plan/
 | `stop_policy` | How many failed reviews, unfinished builder turns and stalls a session may have before the loop waits for the owner; whether the conductor pushes after an accept. |
 | `owner_only` | Actions no agent takes. The builder's prompt and the conductor both carry this list. |
 | `builder_must_not_read` | Paths the builder is told not to open, such as the audit and the rejected first plan. |
+
+## Accepted on this machine
+
+A plan folder's settings name commands that agents run, and its kickoff prompt is what a builder is told. So the helper script believes a plan folder only on a machine where `init` created it or the owner accepted it with `factory.mjs trust --yes`. The record is kept in the user's home folder (`~/.rebuild-factory`), keyed by the plan folder's real path; nothing in a repository or a plan folder can supply it. The settings must name the top folder of a real working repository by absolute path. A change to the commands, the rules file, the builder settings or the kickoff prompt that was not made through the script breaks the acceptance until the owner accepts again. `trust` prints what is being accepted: the commands, what the rules file refuses, the builder settings, the owner-only list, the stop policy, the project paragraph in full, any standing instructions in the log, and the kickoff prompt as the lines added to the plugin's template and the template lines taken out. It refuses a rules file that holds anything besides permissions, or whose shell rules are not a first `"*": "allow"` followed by denies only. It does not show the fixtures, the area files or the session blocks: those are the plan, and reading them is the plan review's job.
+
+A session counts as accepted only when the conductor recorded it with `factory.mjs accept`, which requires an annotated tag on a merge commit on the main branch and a written review. The record is in the same home folder. A tag that was not recorded, or that is no longer the recorded one, is reported and ignored. The seal of the plan folder is kept there too.
+
+These records are out of a clone's reach. They are not out of the builder's: it runs as the same user. The shipped rules refuse commands that name the folder or the helper script, which stops the easy path only.
 
 ## Ids
 

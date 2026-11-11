@@ -33,9 +33,11 @@ For a codebase that exists, mostly works, and that you do not trust. The rule be
 > **Read this before you run it.**
 >
 > - The build stage starts a coding agent (OpenCode) with its commands **auto-approved**. Nobody watches each command.
-> - The plugin ships a rules file that refuses pushes and common deploy commands. It matches command text. **It is not a sandbox.** Edit it for your project's own deploy commands before the first session.
+> - Its rules file refuses the plain forms of `git push` and of common publish and deploy commands by matching command text. A different spelling, a script that deploys from inside, or another tool gets through. It is not a sandbox. Add your project's own deploy commands before the first session.
+> - The control that actually holds is where the builder runs: no production credentials in reach, and a remote its credentials cannot write to.
+> - The audit and every review run the repository's own code on your machine.
 > - Run it on a machine and a repository where an unattended coding agent is acceptable, with no production credentials in reach.
-> - **Status: early.** The method comes from one rebuild that ran this way from audit to build. The helper script and the bridge are tested. The skills and agents have not yet been run on a second codebase.
+> - **Status: early.** The method comes from one rebuild that ran this way from audit to build. It was reviewed by an independent red team before this release. The helper script and the bridge have been exercised on Windows only. The skills and agents have not yet been run on a second codebase.
 
 In a chat opened on the repository you want rebuilt:
 

@@ -14,9 +14,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/factory.mjs" show
 node "${CLAUDE_PLUGIN_ROOT}/scripts/factory.mjs" set <key> <value>
 node "${CLAUDE_PLUGIN_ROOT}/scripts/factory.mjs" add <key> <item>
 node "${CLAUDE_PLUGIN_ROOT}/scripts/factory.mjs" remove <key> <item>
+node "${CLAUDE_PLUGIN_ROOT}/scripts/factory.mjs" unset <key>
 ```
 
-`show` returns every setting with its value, its type and its meaning, and lists what is still empty. Never edit the file directly: the script is what keeps a typo from becoming a dead setting.
+Everything after the key is the value, so a command with its own `--options` needs no quoting. `unset` clears a text or model setting.
+
+`show` returns every setting with its value, its type and its meaning, lists what is still empty, and says whether this plan folder is accepted on this machine. If it is not, the script refuses every change: do not edit the file to get round that. Run `factory.mjs trust`, read what it prints to the owner, and accept with `trust --yes` only on the owner's word. Never edit the file directly: the script is what keeps a typo from becoming a dead setting.
 
 If there is no plan folder yet, run `factory.mjs init` first.
 
@@ -41,7 +44,7 @@ Translate what they said into the key, make the change, and confirm in one line 
 |---|---|
 | "build with <model>" | `set builder.model <id>`. If unsure of the id, run `opencode models` and match it. |
 | "use opus for the plan reviewers", "cheap model for the session review" | `set models.<agent> <name>` |
-| "reviewers on whatever this chat uses" | `set models.<agent> ""` |
+| "reviewers on whatever this chat uses" | `unset models.<agent>` |
 | "allow eight failed reviews" | `set stop_policy.failed_reviews 8` |
 | "push after each accept" | `set stop_policy.push_after_accept true` |
 | "show me the builder's thinking" | `set builder.thinking true` (applies from the next run started) |
@@ -51,7 +54,7 @@ Translate what they said into the key, make the change, and confirm in one line 
 Two changes need a word of caution before you make them:
 
 - **Removing an item from the owner-only list** hands that action to agents. Say what it allows and confirm.
-- **`builder.config`** is the file that refuses pushes and deploys under auto-approve. Never clear it. If the owner points it at another file, read that file and say what it refuses.
+- **`builder.config`** names the rules file: the commands the builder is refused while it runs auto-approved. It cannot be emptied or unset. If the owner points it at another file, read that file, say what it refuses, and run `factory.mjs doctor` to see which sample commands get through. The project's own copy is `factory-plan/builder-rules.json`; edit that one, never the copy inside the plugin. Editing it outside the script breaks the folder's acceptance, which `trust --yes` restores once the owner has seen the change.
 
 A stop limit may be raised freely; it does not lower what counts as passing. If the conductor is running in another chat, tell the owner the change is read at the next session's start, and offer to note it at the top of `handback/PROGRESS.md` so the running conductor sees it.
 

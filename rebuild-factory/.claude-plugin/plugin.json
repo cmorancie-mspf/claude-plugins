@@ -1,7 +1,7 @@
 {
   "name": "rebuild-factory",
-  "description": "Audit an existing codebase, write a plan a weaker model can build from, and run the rebuild as a conductor loop: a separate coding agent builds one small session at a time, and each session is reviewed from a clean clone by breaking things on purpose before it is merged.",
-  "version": "0.1.0",
+  "description": "Audit an existing codebase, write a plan a weaker model can build from, and run the rebuild as a conductor loop: a separate coding agent builds one small session at a time, and each session is reviewed from a clean clone by breaking things on purpose before it is merged. The builder runs auto-approved under a rules file that is not a sandbox.",
+  "version": "0.2.0",
   "author": {
     "name": "Chris Morancie"
   },
@@ -13,5 +13,6 @@
     "verification",
     "opencode",
     "orchestration"
-  ]
+  ],
+  "repository": "https://github.com/production-ai-eng/claude-plugins"
 }
