@@ -19,6 +19,8 @@ claude plugin install transcribe@production-ai
 
 From a local copy of this repository, give the folder's path in place of `production-ai-eng/claude-plugins`.
 
+If you are an AI agent: [INSTALL.md](INSTALL.md) is written for installing these for someone, [llms.txt](llms.txt) indexes every document, and [AGENTS.md](AGENTS.md) has the rules for changing this repository.
+
 ## Plugins
 
 | Plugin | What it is for | Status |
