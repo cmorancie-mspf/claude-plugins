@@ -31,6 +31,20 @@ An MCP server cannot wake an idle Claude session. `opencode_start` and `opencode
 - OpenCode takes its working folder from the `PWD` variable when a POSIX shell set it. The bridge sets `PWD` to the run's folder; without that, a run started from Git Bash works in the caller's folder.
 - A status of `died` means the process is gone without recording an exit, for example after a reboot.
 
+## Supporting another builder tool
+
+The rebuild-factory loop needs five operations from a bridge. A bridge for another coding agent offers the same ones:
+
+| Operation | Must do |
+|---|---|
+| start | Begin a run in a folder from a prompt file, detached, and return at once |
+| answer | Send a follow-up into the same conversation after a run has ended |
+| status | Report running, finished, failed, stopped or died, with the exit code and the end of the log |
+| stop | Kill a run and its child processes, keeping the conversation |
+| wait | A command that blocks until the run ends, so the caller is woken |
+
+It also needs a way to refuse commands under auto-approval.
+
 ## Register with Claude Code
 
 Inside the rebuild-factory plugin this server is registered by the plugin's `.mcp.json`. To use the bridge alone:

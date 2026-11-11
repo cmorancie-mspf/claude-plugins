@@ -1,10 +1,10 @@
 {
-  "name": "mspf-factory",
+  "name": "production-ai",
   "owner": {
-    "name": "MSPF"
+    "name": "Chris Morancie"
   },
   "metadata": {
-    "description": "Take an existing codebase from 'it sort of works' to rebuilt and proven: an independent audit, a plan a weaker model can build from, and a conductor loop that drives a separate coding agent session by session and reviews each one from a clean clone."
+    "description": "Claude Code plugins for engineering work done as planned, proven steps: audits that check what a codebase claims against what it does, plans a cheaper model can build from, and build loops in which nothing is merged on a report alone."
   },
   "plugins": [
     {
