@@ -7,7 +7,7 @@ Plugins for engineering work done as planned, proven steps. One marketplace; ins
 Add the marketplace once:
 
 ```
-claude plugin marketplace add https://gitlab.com/<group>/claude-plugins.git
+claude plugin marketplace add cmorancie-mspf/claude-plugins
 ```
 
 Then install a plugin by name:
@@ -16,7 +16,7 @@ Then install a plugin by name:
 claude plugin install rebuild-factory@production-ai
 ```
 
-From a local copy of this repository, give the folder's path in place of the address.
+From a local copy of this repository, give the folder's path in place of `cmorancie-mspf/claude-plugins`.
 
 ## Plugins
 
@@ -64,11 +64,11 @@ Requires Node 20 or later and git; the build stage also needs [OpenCode](https:/
   skills/  agents/  ...
 ```
 
-To add a plugin: put its folder at the top level, add an entry to `marketplace.json` with `"source": "./<folder>"`, and add a row to the table above. Run `claude plugin validate .` before committing.
+To add a plugin: put its folder at the top level, add an entry to `marketplace.json` with `"source": "./<folder>"`, and add a row to the table above. Run `claude plugin validate .` and `node .github/check.mjs` before committing.
 
 ## Contributing
 
-Reports of what did not work on your codebase are the most useful contribution. Never put a real project's findings, plans or data into this repository.
+Reports of what did not work on your codebase are the most useful contribution. See [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md) for reporting a security problem. Never put a real project's findings, plans or data into this repository.
 
 ## Licence
 
