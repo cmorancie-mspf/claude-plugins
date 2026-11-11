@@ -1,0 +1,45 @@
+{
+  "project": "",
+  "repo": "",
+  "main_branch": "main",
+  "worktree_root": "",
+  "branch_prefix": "factory/",
+  "tag_prefix": "accepted/",
+  "plan_committed": false,
+  "builder": {
+    "tool": "opencode",
+    "model": "",
+    "config": "",
+    "thinking": false
+  },
+  "models": {
+    "audit_reviewer": "",
+    "finding_verifier": "",
+    "plan_reviewer": "",
+    "session_reviewer": "",
+    "read_list_drafter": ""
+  },
+  "commands": {
+    "install": "",
+    "phase": "",
+    "mutate": ""
+  },
+  "stop_policy": {
+    "failed_reviews": 6,
+    "unfinished_turns": 6,
+    "stalls": 2,
+    "push_after_accept": false
+  },
+  "limits": {
+    "max_subagents": 2,
+    "parallel_sessions": 1
+  },
+  "owner_only": [
+    "deploy anything",
+    "delete a deployed resource",
+    "rotate or create a credential",
+    "spend money or subscription usage",
+    "run on a second machine"
+  ],
+  "builder_must_not_read": []
+}
