@@ -24,6 +24,7 @@ _KEYS = (
     "MONGO_URI", "MONGO_HOST", "MONGO_PORT", "MONGO_USER", "MONGO_PASS",
     "MONGO_AUTH_SOURCE", "MONGO_DB", "MONGO_COLLECTION",
     "PROXY_URL", "PROXY_URLS", "PROXY_PORT_COUNT",
+    "EXPERTISE_MINER_SEARCH_STEMMING", "EXPERTISE_MINER_SEARCH_MATCH",
 )
 
 
@@ -65,6 +66,35 @@ def load_settings() -> dict:
     return out
 
 
+# ---------- search ----------------------------------------------------------
+
+
+def _switch(name: str, raw: str, default: bool) -> bool:
+    v = raw.lower()
+    if v == "":
+        return default
+    if v in ("on", "true", "yes", "1"):
+        return True
+    if v in ("off", "false", "no", "0"):
+        return False
+    raise ValueError(f"{name} must be on or off")
+
+
+def search_config(settings: Optional[dict] = None) -> dict:
+    """How search behaves unless a call says otherwise.
+
+    stemming  on: a word also finds its other forms (check, checks, checking). English rules.
+    match     ranked: passages holding more of the words, and rarer words, come first;
+              all: only passages holding every word.
+    """
+    s = settings if settings is not None else load_settings()
+    match = (s["EXPERTISE_MINER_SEARCH_MATCH"] or "ranked").lower()
+    if match not in ("ranked", "all"):
+        raise ValueError("EXPERTISE_MINER_SEARCH_MATCH must be 'ranked' or 'all'")
+    return {"stemming": _switch("EXPERTISE_MINER_SEARCH_STEMMING", s["EXPERTISE_MINER_SEARCH_STEMMING"], True),
+            "match": match}
+
+
 # ---------- storage ---------------------------------------------------------
 
 
@@ -78,7 +108,7 @@ def storage_config(settings: Optional[dict] = None) -> dict:
     if kind == "sqlite":
         raw = s["EXPERTISE_MINER_DB"]
         path = Path(raw).expanduser() if raw else home_dir() / "corpus.db"
-        return {"kind": "sqlite", "path": str(path)}
+        return {"kind": "sqlite", "path": str(path), "stemming": search_config(s)["stemming"]}
     if not (s["MONGO_URI"] or s["MONGO_HOST"]):
         raise ValueError("EXPERTISE_MINER_STORE=mongo needs MONGO_URI, or MONGO_HOST and its companions")
     port = s["MONGO_PORT"] or "27017"

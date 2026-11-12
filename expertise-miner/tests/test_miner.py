@@ -174,29 +174,217 @@ class TargetTests(Base):
         self.assertEqual(job["routes"], ["gate.example:10001"])
 
 
+class NoFts(store_mod.SqliteStore):
+    """A store on a SQLite that has no full-text module."""
+
+    def _fts_available(self):
+        return False
+
+
+JOIN = ["tonight we discuss zebra things at length", "chase a loss on a bad day", "other talk entirely"]
+
+
 class StoreTests(Base):
-    def test_search_returns_timed_passages(self):
+    def talk(self, vid, lines, **kw):
+        """A video whose lines are far enough apart to be one passage each."""
+        return self.video(vid, segments=[[i * 40.0, text] for i, text in enumerate(lines)], **kw)
+
+    def keys(self, st, query, **kw):
+        return [(h["video_id"], h["idx"]) for h in st.search_passages(store_mod.parse_query(query), **kw)]
+
+    def test_search_returns_the_passage_not_just_the_video(self):
         st = self.open()
-        st.upsert_video(self.video())
-        st.upsert_video(self.video(VID_B, channel="Other", channel_handle="@other",
-                                   segments=[[0, "nothing relevant here at all"]]))
-        terms = store_mod.parse_query('"role change" minutes')
-        self.assertEqual(terms, ["role change", "minutes"])
-        hits = st.search(terms)
-        self.assertEqual([h["video_id"] for h in hits], [VID_A])
-        p = store_mod.passages(hits[0], terms)
-        self.assertEqual(p["hits"], 2)
-        self.assertEqual(p["passages"][0]["timestamp"], 4)
-        self.assertIn("minutes a player got", p["passages"][0]["text"])
-        self.assertEqual(st.search(terms, channel="@other"), [])
-        self.assertEqual(len(st.search(["nothing", "minutes"], any_term=True)), 2)
-        self.assertEqual(len(st.search(terms, channel="some expert")), 1)
+        st.upsert_video(self.talk(VID_A, ["welcome to the show everyone", "always check the injury report first",
+                                          "then look at the weather", "the injury report again and the injury report"]))
+        st.upsert_video(self.talk(VID_B, ["nothing relevant here at all"], channel="Other", channel_handle="@other"))
+        hits = st.search_passages(store_mod.parse_query('"injury report"'))
+        self.assertEqual([(h["video_id"], h["idx"]) for h in hits], [(VID_A, 3), (VID_A, 1)])   # said twice ranks first
+        self.assertEqual((hits[1]["seconds"], hits[1]["text"]), (40.0, "always check the injury report first"))
+        self.assertEqual(self.keys(st, "injury", channel="@other"), [])
+        self.assertEqual(len(self.keys(st, "injury", channel="some expert")), 2)
+        self.assertEqual(st.stats()["passages"], 5)
+
+    def test_ranked_prefers_more_and_rarer_words_and_all_requires_every_word(self):
+        st = self.open()
+        st.upsert_video(self.talk(VID_A, ["the weather matters", "the weather and the wind matter",
+                                          "the wind", "the", "the thing", "the other thing", "the end"]))
+        self.assertEqual(self.keys(st, "the weather wind")[0], (VID_A, 1))      # holds all three
+        self.assertEqual(len(self.keys(st, "the weather wind")), 7)             # the others still listed
+        self.assertEqual(self.keys(st, "the weather wind", match="all"), [(VID_A, 1)])
+        self.assertEqual(self.keys(st, "zebra"), [])
+
+    def test_stemming_finds_other_forms_and_can_be_switched_off(self):
+        st = self.open()
+        st.upsert_video(self.talk(VID_A, ["he is stacking two players", "nothing here", "they stacked it"]))
+        self.assertEqual(sorted(self.keys(st, "stack")), [(VID_A, 0), (VID_A, 2)])
+        st.close()
+        os.environ["EXPERTISE_MINER_SEARCH_STEMMING"] = "off"
+        st = self.open()                                                        # the index is rebuilt on open
+        self.assertFalse(st.stemming)
+        self.assertEqual(self.keys(st, "stack"), [])
+        self.assertEqual(self.keys(st, "stacking"), [(VID_A, 0)])
+        os.environ["EXPERTISE_MINER_SEARCH_STEMMING"] = "sometimes"
+        with self.assertRaises(ValueError):
+            config.search_config()
+
+    def test_a_phrase_that_crosses_two_passages_is_still_found(self):
+        st = self.open()
+        st.upsert_video(self.talk(VID_A, ["and the rule is never ever", "chase a loss on a bad night", "other talk"]))
+        self.assertEqual(self.keys(st, '"never ever chase a loss"'), [(VID_A, 0)])
+        self.assertEqual(self.keys(st, '"chase a loss"'), [(VID_A, 1)])         # wholly in the second: not the first too
+        self.assertEqual(self.keys(st, "chase"), [(VID_A, 1)])                  # a single word never counts at a join
+        self.assertEqual(self.keys(st, '"never ever chase a loss" night', match="all"), [])
+        self.assertEqual(self.keys(st, '"never ever chase a loss" rule', match="all"), [(VID_A, 0)])
+        # ranked: the passage with the phrase is kept, and first, though the next one matched another word
+        self.assertEqual(self.keys(st, '"never ever chase a loss" night'), [(VID_A, 0), (VID_A, 1)])
+
+    def test_a_neighbour_is_never_returned_for_what_only_the_next_passage_holds(self):
+        for st in (self.open(), NoFts(str(self.home / "n.db"))):
+            self.addCleanup(st.close)
+            st.upsert_video(self.talk(VID_A, JOIN))
+            self.assertEqual(self.keys(st, '"chase a loss" zebra', match="all"), [], type(st).__name__)
+            self.assertEqual(self.keys(st, "zebra chase", match="all"), [], type(st).__name__)
+            self.assertEqual(self.keys(st, '"chase a loss"'), [(VID_A, 1)], type(st).__name__)
+            self.assertEqual(sorted(self.keys(st, '"chase a loss" zebra')), [(VID_A, 0), (VID_A, 1)])
+
+    def test_a_common_phrase_never_brings_in_passages_that_do_not_hold_it(self):
+        st = self.open()
+        lines = []
+        for i in range(120):                          # "you know" opens every third passage and sits inside the next
+            lines.append(["you know it starts here", "and then you know in the middle", "nothing of the kind"][i % 3])
+        st.upsert_video(self.talk(VID_A, lines))
+        st.upsert_video(self.talk(VID_B, ["they said you", "know what happened", "tail"] * 8))    # 8 real crossings
+        old = (store_mod.JOIN_CANDIDATES, store_mod.CROSS_FIRST)
+        self.addCleanup(lambda: (setattr(store_mod, "JOIN_CANDIDATES", old[0]), setattr(store_mod, "CROSS_FIRST", old[1])))
+        for cands, first in ((500, 10), (7, 10), (500, 3)):
+            store_mod.JOIN_CANDIDATES, store_mod.CROSS_FIRST = cands, first
+            for query, match in (('"you know"', "ranked"), ('"you know"', "all"), ('"you know" nothing', "ranked")):
+                hits = st.search_passages(store_mod.parse_query(query), match=match, limit=200)
+                crossing = [h for h in hits if "you know" not in h["text"] and "nothing" not in h["text"]]
+                self.assertTrue(all(h["video_id"] == VID_B and h["text"] == "they said you" for h in crossing),
+                                (cands, first, query, match))
+                self.assertLessEqual(len(crossing), first)
+        store_mod.JOIN_CANDIDATES, store_mod.CROSS_FIRST = 500, 10
+        self.assertEqual(len([k for k in self.keys(st, '"you know"', limit=200) if k[0] == VID_B]), 8)
+
+    def test_storing_a_video_again_replaces_its_index_rows(self):
+        st = self.open()
+        st.upsert_video(self.talk(VID_A, ["bankroll first", "bankroll second", "third"]))
+        st.upsert_video(self.talk(VID_B, ["other bankroll"]))
+        st.upsert_video(self.talk(VID_A, ["staking only"]))
+        self.assertEqual(self.keys(st, "bankroll"), [(VID_B, 0)])
+        self.assertEqual(self.keys(st, "staking"), [(VID_A, 0)])
+        self.assertEqual(st._db.execute("SELECT COUNT(*) FROM passages_fts").fetchone()[0], st.stats()["passages"])
+
+    def test_a_phrase_longer_than_the_join_window_does_not_cross(self):
+        st = self.open()
+        a = " ".join(f"a{i}" for i in range(30))
+        b = " ".join(f"b{i}" for i in range(30))
+        st.upsert_video(self.talk(VID_A, [a, b]))
+        twelve = " ".join(a.split()[-12:] + b.split()[:12])
+        self.assertEqual(self.keys(st, f'"{twelve}"'), [(VID_A, 0)])
+        self.assertEqual(self.keys(st, '"' + " ".join(a.split()[-14:] + b.split()[:14]) + '"'), [])
+
+    def test_a_title_word_finds_the_first_passage_not_every_passage(self):
+        for st in (self.open(), NoFts(str(self.home / "n.db"))):
+            self.addCleanup(st.close)
+            st.upsert_video(self.talk(VID_A, ["opening words"] + ["filler talk"] * 30 + ["my bankroll rule"],
+                                      title="Bankroll basics"))
+            self.assertEqual(sorted(self.keys(st, "bankroll")), [(VID_A, 0), (VID_A, 31)], type(st).__name__)
+            self.assertEqual(self.keys(st, "basics opening", match="all"), [(VID_A, 0)], type(st).__name__)
+
+    def test_the_index_follows_the_sqlite_it_is_opened_with(self):
+        path = str(self.home / "switch.db")
+        st = NoFts(path)
+        st.upsert_video(self.talk(VID_A, ["he is stacking two players"]))
+        self.assertEqual(st.index_info(), {"stemming": False, "full_text": False})
+        st.close()
+        st = store_mod.SqliteStore(path)                                        # now with the full-text module
+        self.assertEqual(st.index_info(), {"stemming": True, "full_text": True})
+        self.assertEqual(self.keys(st, "stack"), [(VID_A, 0)])                  # built, not left empty
+        st.close()
+        st = NoFts(path)                                                        # and back, with the table left behind
+        self.addCleanup(st.close)
+        self.assertEqual(self.keys(st, "stacking"), [(VID_A, 0)])
+        self.assertEqual(self.keys(st, "stack"), [])
+
+    def test_videos_stored_by_a_first_version_process_are_indexed_on_open(self):
+        st = self.open()
+        st.upsert_video(self.talk(VID_A, ["bankroll one"]))
+        st._db.execute("INSERT INTO videos (video_id, channel, title, transcript, segments) VALUES (?, ?, ?, ?, ?)",
+                       (VID_B, "Some Expert", "t", "x", json.dumps([[0, "bankroll two"]])))
+        st._db.execute("CREATE VIRTUAL TABLE videos_fts USING fts5(video_id UNINDEXED, title, transcript)")
+        st._db.commit()
+        st.close()
+        st = self.open()
+        self.assertEqual({k[0] for k in self.keys(st, "bankroll")}, {VID_A, VID_B})
+        self.assertEqual(st._db.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'videos_fts'").fetchone()[0], 0)
+        self.assertEqual(st.repair(), 0)
+
+    def test_an_emptied_index_is_rebuilt_a_video_at_a_time_and_picks_up_where_it_stopped(self):
+        st = self.open()
+        for i in range(45):
+            st.upsert_video(self.talk(f"{i:011d}", [f"bankroll talk {i}"]))
+        st._db.execute("DELETE FROM passages WHERE video_id >= '00000000020'")   # as after an interrupted rebuild
+        st._db.commit()
+        self.assertEqual(st.repair(), 25)
+        self.assertEqual(st.stats()["passages"], 45)
+
+    def test_terms_too_long_to_be_real_are_dropped(self):
+        self.assertEqual(store_mod.parse_query("ok " + "x" * 65 + ' "' + "w " * 41 + '"'), ["ok"])
+        st = NoFts(str(self.home / "n.db"))
+        self.addCleanup(st.close)
+        st.upsert_video(self.talk(VID_A, ["\u00c9MILE said so"]))
+        self.assertEqual(self.keys(st, "\u00e9mile"), [(VID_A, 0)])             # not lost to ASCII-only lower-casing
+        st.search_passages(store_mod.parse_query("y" * 100000))
+
+    def test_a_corpus_from_the_first_version_is_indexed_when_opened(self):
+        import sqlite3
+        path = self.home / "corpus.db"
+        db = sqlite3.connect(path)
+        db.executescript("""CREATE TABLE videos (video_id TEXT PRIMARY KEY, channel TEXT, channel_handle TEXT,
+            channel_id TEXT, title TEXT, url TEXT, duration_seconds INTEGER, view_count INTEGER, upload_date TEXT,
+            kind TEXT, language TEXT, is_generated INTEGER, transcript TEXT, segments TEXT, source TEXT,
+            fetched_at TEXT);
+            CREATE VIRTUAL TABLE videos_fts USING fts5(video_id UNINDEXED, title, transcript);""")
+        db.execute("INSERT INTO videos (video_id, channel, title, transcript, segments) VALUES (?, ?, ?, ?, ?)",
+                   (VID_A, "Some Expert", "Old", "x", json.dumps([[0, "bankroll comes first"], [50, "then the rest"]])))
+        db.execute("INSERT INTO videos (video_id, channel, title, transcript, segments) VALUES (?, ?, ?, ?, ?)",
+                   (VID_B, "Some Expert", "Older", "a record with text only about bankroll " * 30, "[]"))
+        db.commit()
+        db.close()
+        st = self.open()
+        hits = st.search_passages(["bankroll"])
+        self.assertEqual({h["video_id"] for h in hits}, {VID_A, VID_B})
+        self.assertIsNone([h for h in hits if h["video_id"] == VID_B][0]["seconds"])   # no timed lines, no time
+        self.assertEqual(st._db.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'videos_fts'").fetchone()[0], 0)
+        st.close()
+        self.assertEqual(len(self.open().search_passages(["bankroll"])), len(hits))    # opening again changes nothing
+
+    def test_search_still_works_where_sqlite_has_no_full_text_index(self):
+        st = NoFts(str(self.home / "nofts.db"))
+        self.addCleanup(st.close)
+        st.upsert_video(self.talk(VID_A, ["the weather matters", "the weather and the wind matter", "nothing"]))
+        self.assertEqual(self.keys(st, "weather wind")[0], (VID_A, 1))
+        self.assertEqual(self.keys(st, "weather wind", match="all"), [(VID_A, 1)])
+        self.assertEqual(self.keys(st, "weath"), [])                            # whole words only
+        st.upsert_video(self.talk(VID_B, ["and the rule is never ever", "chase a loss on a bad night", "other talk"]))
+        self.assertEqual(self.keys(st, '"never ever chase a loss"'), [(VID_B, 0)])
+        self.assertEqual(self.keys(st, '"chase a loss"'), [(VID_B, 1)])
+
+    def test_several_rankings_merge_so_that_agreement_wins(self):
+        self.assertEqual(store_mod.fuse([["a", "b", "c"], ["c", "a"], ["d"]])[:2], ["a", "c"])
+        self.assertEqual(store_mod.fuse([[], ["x"]]), ["x"])
+        self.assertEqual(store_mod.fuse([]), [])
 
     def test_a_query_cannot_break_out_of_the_search_syntax(self):
         st = self.open()
         st.upsert_video(self.video())
-        for q in ('minutes" OR "a', "minutes) OR (x", "NEAR(minutes", "title:minutes*", "'; DROP TABLE videos;--"):
-            st.search(store_mod.parse_query(q))
+        for q in ('minutes" OR "a', "minutes) OR (x", "NEAR(minutes", "title:minutes*", "'; DROP TABLE videos;--",
+                  "minutes AND NOT welcome", "^minutes", "{title body}: minutes", "-minutes"):
+            for match in ("ranked", "all"):
+                st.search_passages(store_mod.parse_query(q), match=match)
+        self.assertEqual(self.keys(st, "minutes NOT zebra", match="all"), [])    # NOT is a word here, not an operator
         self.assertTrue(st.has_video(VID_A))
 
     def test_a_phrase_can_cross_lines_and_punctuation(self):
@@ -228,7 +416,8 @@ class StoreTests(Base):
         self.assertIsNone(st.get_miss(VID_A))
         self.assertEqual(st.stats()["videos"], 1)
         self.assertEqual(st.get_video(VID_A)["title"], "New title")
-        self.assertEqual(len(st.search(["new", "title"])), 1)
+        self.assertTrue(st.search_passages(["new", "title"], match="all"))   # found by its title
+        self.assertEqual(st.search_passages(["how", "i", "research"], match="all"), [])   # the old title is gone
         ch = st.channels()[0]
         self.assertEqual((ch["channel"], ch["videos"], ch["with_timestamps"]), ("Some Expert", 1, 1))
 
@@ -658,7 +847,8 @@ class ServerTests(Base):
                                  "list_corpus", "mine_prepare", "mine_verify", "mine_build"})
         self.assertEqual(self.body(out[2])["channels"][0]["videos"], 1)
         hit = self.body(out[3])["results"][0]
-        self.assertEqual((hit["video_id"], hit["passages"][0]["at"]), (VID_A, "00:12"))
+        self.assertEqual((hit["video_id"], hit["passages"][0]["at"]), (VID_A, "00:00"))
+        self.assertTrue(hit["passages"][0]["url"].endswith(f"{VID_A}&t=0s"))
         text = self.body(out[4])["transcript"]
         self.assertTrue(text.startswith("[00:00] welcome back everybody"))
         self.assertIn("\n[01:05] second point", text)
@@ -666,6 +856,55 @@ class ServerTests(Base):
         for i in (6, 7, 8):
             self.assertTrue(out[i]["result"]["isError"], i)
         self.assertEqual(out[9]["error"]["code"], -32601)
+
+    def test_several_wordings_are_searched_and_merged(self):
+        st = self.open()
+        st.upsert_video(self.video(VID_B, title="Money talk", segments=[
+            [0, "how much I put in play each night"], [40, "my bankroll rules are simple"],
+            [80, "bankroll and how much I put in play decide everything"], [120, "unrelated chatter"]]))
+        st.close()
+        call = lambda args: ("tools/call", {"name": "search_transcripts", "arguments": args})   # noqa: E731
+        out = self.rpc(call({"query": "bankroll", "queries": ["put in play", "zebra crossing"], "channel": "Some Expert"}),
+                       call({"queries": ["bankroll"], "match": "all", "passages_per_video": 1}),
+                       call({"query": "!!! ???"}), call({}), call({"queries": [f"word{i}" for i in range(9)]}),
+                       call({"query": "bankroll", "match": "fuzzy"}))
+        first = self.body(out[1])
+        self.assertEqual([w["passages_found"] for w in first["wordings"]], [2, 2, 0])   # the empty wording is reported
+        res = first["results"][0]
+        self.assertEqual((res["video_id"], res["matching_passages"]), (VID_B, 3))
+        self.assertEqual(res["passages"][0]["at"], "01:20")                    # the one both wordings found
+        self.assertTrue(first["stemming"])
+        self.assertEqual(len(self.body(out[2])["results"][0]["passages"]), 1)
+        for i in (3, 4, 5, 6):
+            self.assertTrue(out[i]["result"]["isError"], i)
+
+    def test_search_arguments_are_checked_and_the_report_follows_the_index_on_disk(self):
+        st = self.open()
+        st.upsert_video(self.video(VID_B, segments=[[0, "he is stacking two players"], [40, "two players only"]]))
+        st.close()
+        call = lambda args: ("tools/call", {"name": "search_transcripts", "arguments": args})   # noqa: E731
+        out = self.rpc(call({"queries": "stack"}), call({"queries": [None]}), call({"query": 5}),
+                       call({"query": "stack", "queries": ["stack", " stack "]}),
+                       call({"query": "stacking players", "any_term": False}),
+                       call({"query": "stacking players", "any_term": True}))
+        for i in (1, 2, 3):
+            self.assertTrue(out[i]["result"]["isError"], i)
+        self.assertEqual(len(self.body(out[4])["wordings"]), 1)                 # the same wording is not counted twice
+        self.assertEqual(self.body(out[5])["match"], "all")
+        self.assertEqual(self.body(out[5])["results"][0]["matching_passages"], 1)
+        self.assertEqual(self.body(out[6])["results"][0]["matching_passages"], 2)
+        self.assertEqual((self.body(out[4])["stemming"], self.body(out[4])["ranked_by"]), (True, "bm25"))
+        os.environ["EXPERTISE_MINER_SEARCH_STEMMING"] = "off"
+        self.open().close()                                                     # another process rebuilds unstemmed
+        del os.environ["EXPERTISE_MINER_SEARCH_STEMMING"]
+        store_mod.SqliteStore(str(self.home / "corpus.db"), stemming=False).close()
+        import server as server_mod
+        server_mod._store = store_mod.SqliteStore(str(self.home / "corpus.db"), stemming=False)
+        self.addCleanup(lambda: (server_mod._store.close(), setattr(server_mod, "_store", None)))
+        server_mod._store.stemming = True                                       # what a long-lived server still believes
+        got = server_mod.t_search({"query": "stack"})
+        self.assertEqual((got["stemming"], got["videos"]), (False, 0))
+        self.assertNotIn("other forms", got["note"])
 
     def test_long_transcripts_come_in_parts(self):
         segs = [[i * 5.0, f"line number {i} " + "word " * 40] for i in range(60)]
