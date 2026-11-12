@@ -28,6 +28,7 @@ _KEYS = (
     "EXPERTISE_MINER_SEARCH_STEMMING", "EXPERTISE_MINER_SEARCH_MATCH",
     "EXPERTISE_MINER_EMBED_URL", "EXPERTISE_MINER_EMBED_KEY", "EXPERTISE_MINER_EMBED_MODEL",
     "EXPERTISE_MINER_EMBED_BATCH",
+    "EXPERTISE_MINER_WORKERS", "EXPERTISE_MINER_DELAY_MS",
 )
 
 
@@ -249,15 +250,42 @@ def describe_embed(cfg: Optional[dict]) -> str:
 _PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
 
 
+# Proxy providers commonly export a route as host:port:user:pass. That order is refused with a
+# message that says how to write it, without echoing the user name or the password.
+_EXPORT_ORDER = re.compile(r"^(?:([A-Za-z][A-Za-z0-9+.\-]*)://)?([A-Za-z0-9\-]+\.[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\]):(\d{1,5}):([^:@/\s]+):(.+)$")
+_EXPORT_PREFIX = re.compile(r"^(?:([A-Za-z][A-Za-z0-9+.\-]*)://)?(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\]):\d{1,5}:")
+ENCODE_HINT = ("if the user name or password holds @ : / # ? or %, write them as %40 %3A %2F %23 %3F %25 "
+               "(other characters, such as =, can stay as they are)")
+
+
 def _check_proxy(url: str) -> str:
+    """The URL's form only: nothing is contacted. Messages never repeat the user name or password."""
+    if re.search(r"[\s\x00-\x1f\x7f]", url):
+        raise ValueError("a proxy URL must not hold spaces or control characters")
+    # The export order, with or without a raw @ in the password (then the part before the last @
+    # holds host:port:user). The message names neither the host nor anything after it, so a
+    # user:pass:host:port line read the wrong way round cannot echo a credential.
+    before_at = url.rpartition("@")[0] if "@" in url else ""
+    m = _EXPORT_ORDER.match(url)
+    if (m and "@" not in url) or _EXPORT_PREFIX.match(before_at):
+        scheme = ((m.group(1) if m else _EXPORT_PREFIX.match(before_at).group(1)) or "http").lower()
+        raise ValueError(f"a proxy URL looks like host:port:user:pass, the order proxy providers export it in. "
+                         f"Write it as {scheme}://USER:PASSWORD@HOST:PORT, and " + ENCODE_HINT)
     try:
         parts = urlsplit(url)
         host, _ = parts.hostname, parts.port
     except ValueError:
-        raise ValueError("a proxy URL could not be read") from None
+        raise ValueError("a proxy URL could not be read. It must look like http://user:pass@host:port; "
+                         + ENCODE_HINT) from None
     if parts.scheme not in _PROXY_SCHEMES or not host:
         raise ValueError("a proxy URL must look like http://user:pass@host:port "
                          "(http, https, socks5 or socks5h)")
+    if parts.netloc.count("@") > 1:
+        raise ValueError("a proxy URL holds more than one @ before its host, so the user name or password "
+                         "holds a raw @: write it as %40. In general, " + ENCODE_HINT)
+    if "@" in parts.path + parts.query + parts.fragment:
+        raise ValueError("a proxy URL holds an @ after a / # or ?, so the user name or password holds one of "
+                         "those raw: " + ENCODE_HINT)
     return url
 
 
@@ -341,6 +369,27 @@ def scrub(text: str, settings: Optional[dict] = None) -> str:
     out = re.sub(r"(\bBearer\s+)[^\s\"',;]+", r"\1[hidden]", out, flags=re.I)
     # the user-and-password part of any other URL, up to the last @ before the host
     return re.sub(r"([a-z][a-z0-9+.\-]*://)[^/\s]*@", r"\1[hidden]@", out, flags=re.I)
+
+
+def pull_rate(settings: Optional[dict] = None) -> dict:
+    """The pull defaults from the settings: {'workers': n or None, 'delay_ms': n or None}.
+
+    EXPERTISE_MINER_WORKERS   workers for a pull that does not say. Still never more than the
+                              distinct routes, and at most MAX_WORKERS.
+    EXPERTISE_MINER_DELAY_MS  the pause per worker for a pull that does not say. Still never under
+                              MIN_DELAY_MS.
+    A value given on a pull wins over both."""
+    s = settings if settings is not None else load_settings()
+    out: dict = {}
+    for key, name, top in (("workers", "EXPERTISE_MINER_WORKERS", 1000), ("delay_ms", "EXPERTISE_MINER_DELAY_MS", 600_000)):
+        raw = s[name]
+        if not raw:
+            out[key] = None
+            continue
+        if not raw.isdigit() or not (1 <= int(raw) <= top):
+            raise ValueError(f"{name} must be a whole number from 1 to {top}")
+        out[key] = int(raw)
+    return out
 
 
 def clamp_workers(requested: int, n_routes: int) -> int:

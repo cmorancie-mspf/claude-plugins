@@ -37,6 +37,12 @@ KIND_OF_TAB = {"videos": "video", "shorts": "short", "streams": "stream"}
 PERMANENT = {"NoTranscriptFound", "TranscriptsDisabled", "VideoUnavailable", "AgeRestricted",
              "VideoUnplayable", "InvalidVideoId", "EmptyTranscript"}
 BLOCKED = {"RequestBlocked", "IpBlocked"}
+PROXY_REASONS = {"proxy_login": "ProxyLoginRefused", "proxy_unreachable": "ProxyUnreachable",
+                 "proxy_setup": "ProxySupportMissing"}
+
+
+def pull_install_hint(package: str) -> str:
+    return "ask the person before running " + shell_command([sys.executable, "-m", "pip", "install", package])
 YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 
 _VIDEO_ID = r"[A-Za-z0-9_-]{11}"
@@ -276,17 +282,26 @@ def build_job(spec: dict) -> dict:
     max_videos = int(spec.get("max_videos", config.DEFAULT_MAX_VIDEOS))
     if max_videos < 0 or max_videos > 100_000:
         raise PullError("max_videos must be 0 (no limit) to 100000")
+    # A value on the pull wins; then the settings' pull defaults; then the built-in ones. The
+    # limits apply whichever it came from.
+    rate = config.pull_rate(settings)
+    asked = {k: (int(spec[k]) if spec.get(k) else None) for k in ("workers", "delay_ms")}
+    wanted_workers = asked["workers"] or rate["workers"] or 1
+    wanted_delay = asked["delay_ms"] or rate["delay_ms"] or config.DEFAULT_DELAY_MS
     job = {
         "id": time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
         "kind": kind, "target": target, "include": tabs,
         "max_videos": max_videos, "min_views": max(0, int(spec.get("min_views") or 0)),
         "details": bool(spec.get("details", True)) or int(spec.get("min_views") or 0) > 0,
         "languages": languages,
-        "workers": config.clamp_workers(int(spec.get("workers") or 1), len(routes)),
-        "delay_ms": config.clamp_delay_ms(int(spec.get("delay_ms") or config.DEFAULT_DELAY_MS)),
+        "workers": config.clamp_workers(wanted_workers, len(routes)),
+        "delay_ms": config.clamp_delay_ms(wanted_delay),
+        "workers_wanted": wanted_workers, "asked": asked,
+        "rate_from": {k: "pull" if asked[k] else "settings" if rate[k] else "default" for k in asked},
         "refresh": bool(spec.get("refresh")), "retry_missing": bool(spec.get("retry_missing")),
         "resumed_from": spec.get("resumed_from") or "",
-        "routes": [config.mask_proxy(r) for r in routes],
+        "routes": [config.mask_proxy(r) for r in routes], "routes_held_back": [], "routes_out": [],
+        "warnings": [],
         "state": "starting", "created": time.time(), "heartbeat": time.time(),
         "counts": {"listed": 0, "selected": 0, "done": 0, "stored": 0, "skipped_existing": 0,
                    "skipped_known_missing": 0, "skipped_min_views": 0, "no_transcript": 0, "failed": 0},
@@ -298,7 +313,7 @@ def build_job(spec: dict) -> dict:
 def create_job(spec: dict) -> dict:
     """Validate a request, record it, and start its worker. Returns the job record."""
     job = build_job(spec)
-    check_cooldown(job)
+    job["routes_held_back"] = check_cooldown(job)
     return launch(job, Path(__file__).resolve(), PULL_LOCK)
 
 
@@ -356,18 +371,57 @@ def wait_command(job_id: str, script: Optional[Path] = None) -> str:
     return shell_command([sys.executable, str(script or Path(__file__).resolve()), "wait", job_id])
 
 
-def check_cooldown(job: dict) -> None:
-    """Refuse a new pull over routes the site has just refused."""
+def cooling_routes() -> dict:
+    """{route as host:port: when its cool-down ends}, for routes still cooling down. A route is put
+    here when the site stopped answering over it; other routes are not held back."""
     try:
         cd = json.loads((jobs_dir() / "cooldown.json").read_text(encoding="utf-8"))
-        left = float(cd["until"]) - time.time()
-        same = set(cd["routes"]) & set(job["routes"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return
-    if left > 0 and same:
-        raise PullError(f"the site refused requests from {', '.join(sorted(same))} a short while ago. No pull "
-                        f"over that route starts for another {int(left // 60) + 1} minutes. Waiting longer is "
-                        "better; a different proxy route is not held back.")
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    try:
+        if isinstance(cd.get("routes"), list):          # the 0.3.1 form: one time for every route of the job
+            pairs = [(r, cd["until"]) for r in cd["routes"]]
+        else:
+            pairs = list((cd.get("routes") or {}).items())
+        return {str(r): float(u) for r, u in pairs if float(u) > now}
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {}
+
+
+_COOLDOWN_LOCK = threading.Lock()      # the workers of the one pull running write it; never two at once
+
+
+def cool_down(masked_route: str, seconds: float = COOLDOWN_S) -> None:
+    """Hold one route back from new pulls for a while. Called by the only pull running."""
+    with _COOLDOWN_LOCK:
+        held = cooling_routes()
+        held[masked_route] = max(held.get(masked_route, 0.0), time.time() + seconds)
+        path = jobs_dir() / "cooldown.json"
+        tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps({"routes": held}), encoding="utf-8")
+        for attempt in range(6):          # a reader on Windows can hold the file for a moment
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (attempt + 1))
+        os.replace(tmp, path)
+
+
+def check_cooldown(job: dict) -> list:
+    """Refuse a new pull when every route it could use is cooling down after the site refused it.
+    Returns the routes held back, which the pull then leaves out; the rest are used."""
+    held = cooling_routes()
+    mine = [r for r in job["routes"] if r in held]
+    if mine and len(mine) == len(job["routes"]):
+        left = min(held[r] for r in mine) - time.time()
+        what = ("this address" if mine == ["direct"] else
+                "every proxy route set (" + ", ".join(sorted(set(mine))) + ")")
+        raise PullError(f"the site stopped answering over {what} a short while ago. No pull over a route starts "
+                        f"until its cool-down ends; the first ends in {int(left // 60) + 1} minutes. Waiting "
+                        "longer is better.")
+    return sorted(set(mine))
 
 
 # ---------- listing and fetching (the only code that contacts the site; embed.py is the only
@@ -375,20 +429,106 @@ def check_cooldown(job: dict) -> None:
 
 
 class _Quiet:
+    """yt-dlp's logger. Prints nothing, and keeps the last errors and warnings so that a failure
+    can be explained: with ignoreerrors on, yt-dlp returns None and says why only here."""
+    KEEP = 20
+
+    def __init__(self):
+        self.errors: list = []
+        self.warnings: list = []
+
     def debug(self, msg): pass
     def info(self, msg): pass
-    def warning(self, msg): pass
-    def error(self, msg): pass
+
+    def warning(self, msg):
+        self.warnings = (self.warnings + [str(msg)])[-self.KEEP:]
+
+    def error(self, msg):
+        self.errors = (self.errors + [str(msg)])[-self.KEEP:]
 
 
-def _ydl(proxy: Optional[str], extra: dict):
+def _ydl(proxy: Optional[str], extra: dict, logger: Optional[_Quiet] = None):
     from yt_dlp import YoutubeDL
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _Quiet(),
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": logger or _Quiet(),
             "ignoreerrors": True, "socket_timeout": 30}
     if proxy:
         opts["proxy"] = proxy
     opts.update(extra)
     return YoutubeDL(opts)
+
+
+# What yt-dlp or the transcript library said, sorted into causes a person can act on. Checked in
+# this order: a proxy failure is named first, because it hides every other cause.
+_CAUSES = (
+    # Specific phrases only: a bare "407" can be part of a video id, and every requests error over a
+    # SOCKS proxy names its SOCKSHTTPSConnectionPool, so neither alone says the proxy failed.
+    ("proxy_setup", ("missing dependencies for socks",)),
+    ("proxy_login", ("407 proxy authentication", "http error 407", "tunnel connection failed: 407",
+                     "tunnel failed, response 407",
+                     "proxy authentication required", "proxy authentication failed",
+                     "socks5 authentication failed", "socks5 authentication error")),
+    ("proxy_unreachable", ("unable to connect to proxy", "tunnel connection failed", "cannot connect to proxy",
+                           "caused by proxyerror", "socks5proxyerror", "socks4proxyerror", "generalproxyerror",
+                           "socks proxy")),
+    ("bot_check", ("sign in to confirm", "confirm you're not a bot", "confirm you are not a bot")),
+    ("region", ("not available in your country", "blocked it in your country", "geo restrict",
+                "not made this video available in your country")),
+    ("unavailable", ("private video", "video unavailable", "this video has been removed", "has been terminated",
+                     "this video is no longer available", "does not exist", "members-only", "join this channel")),
+    ("network", ("timed out", "connection refused", "name or service not known", "getaddrinfo failed",
+                 "nodename nor servname", "network is unreachable", "connection reset")),
+)
+
+
+def classify(messages: list, proxy: Optional[str]) -> str:
+    """The cause behind a list of error messages: one of the names in _CAUSES, or ''."""
+    text = " ".join(str(m) for m in messages).lower()
+    for cause, words in _CAUSES:
+        if cause.startswith("proxy") and not proxy:
+            continue
+        if any(w in text for w in words):
+            return cause
+    return ""
+
+
+def explain(cause: str, proxy: Optional[str], what: str) -> str:
+    """A message for the person. Names the route as host:port only."""
+    route = config.mask_proxy(proxy)
+    return {
+        "proxy_login": f"the proxy {route} refused the login: check the user name and password in PROXY_URL or "
+                       f"PROXY_URLS ({config.ENCODE_HINT}). proxy_test checks every route",
+        "proxy_unreachable": f"the proxy {route} could not be reached or would not open the connection: check its "
+                             "host and port, and that the proxy plan is active. proxy_test checks every route",
+        "proxy_setup": "a SOCKS proxy is set, and SOCKS needs the PySocks package, which is not installed in "
+                       f"the Python the server uses: {pull_install_hint('PySocks')}",
+        "bot_check": f"the site asked for a sign-in to prove this is not a bot, over {route}. That is the site "
+                     "refusing this address: wait some hours, or use other proxy routes",
+        "region": f"{what} is not available in the country of {route}",
+        "unavailable": f"{what} is private, removed, members-only or does not exist",
+        "network": f"the connection over {route} failed or timed out: check this machine's network"
+                   + (" and the proxy" if proxy else ""),
+    }.get(cause, "")
+
+
+def _failure(log: _Quiet, proxy: Optional[str], what: str, fallback: str) -> PullError:
+    """The PullError for a read that came back empty: the classified cause, or yt-dlp's own last
+    words (with every configured credential filtered out), or the fallback."""
+    cause = classify(log.errors, proxy)
+    if cause:
+        return PullError(explain(cause, proxy, what))
+    last = next((m for m in reversed(log.errors) if m.strip()), "")
+    if last:
+        return PullError(f"{fallback}. yt-dlp said: " + config.scrub(last)[:300])
+    return PullError(fallback)
+
+
+def _note_warnings(job: dict, log: _Quiet) -> None:
+    """yt-dlp's own warnings (for example that it is out of date) go into the job record, each once."""
+    notes = job.setdefault("warnings", [])
+    for w in log.warnings:
+        line = "yt-dlp: " + config.scrub(w)[:300]
+        if line not in notes and len(notes) < 12:
+            notes.append(line)
 
 
 def _entry(e: dict, kind: str, parent: dict) -> dict:
@@ -409,6 +549,28 @@ def _entry(e: dict, kind: str, parent: dict) -> dict:
     }
 
 
+def cut_short(n: int, site_count, end: Optional[int], page: int) -> str:
+    """A warning when a listing looks cut off, else ''. An out-of-date yt-dlp stops at the end of
+    the first page (100 for a playlist, 30 for a channel tab) and says nothing. `n` counts what the
+    listing returned, `site_count` is the total the site reported (None when it gave none) and
+    `end` the cap asked for (None for no cap)."""
+    if n <= 0 or (end and n >= end):
+        return ""
+    whole_pages = n % page == 0
+    try:
+        total = int(site_count) if site_count is not None else None
+    except (TypeError, ValueError):
+        total = None
+    fix = ("An out-of-date yt-dlp does this: setup_check prints the upgrade command. Then pull again; videos "
+           "already stored are skipped.")
+    if total is not None and n < total and (whole_pages or total - n > max(5, total // 20)):
+        return f"listed {n} of the {total} videos the site says it holds, so the listing may have been cut short. {fix}"
+    if total is None and whole_pages:
+        return (f"listed exactly {n} videos, a whole number of the site's pages of {page}, so the listing may have "
+                f"been cut short. {fix}")
+    return ""
+
+
 def list_videos(job: dict, proxy: Optional[str]) -> list:
     """The videos a job covers, newest first as YouTube lists them. No transcripts yet."""
     cap = job["max_videos"]
@@ -417,11 +579,13 @@ def list_videos(job: dict, proxy: Optional[str]) -> list:
     if end:
         flat["playlistend"] = end
     out: list = []
+    log = _Quiet()
     if job["kind"] == "video":
-        with _ydl(proxy, {}) as ydl:
+        with _ydl(proxy, {}, log) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={job['target']}", download=False)
+        _note_warnings(job, log)
         if not info or not info.get("id"):
-            raise PullError("that video could not be read: it may be private, removed or region-locked")
+            raise _failure(log, proxy, "that video", "that video could not be read")
         kind = "stream" if info.get("was_live") else "video"
         return [{**_entry(info, kind, {}), "has_details": True}]
     if job["kind"] == "playlist":
@@ -431,18 +595,25 @@ def list_videos(job: dict, proxy: Optional[str]) -> list:
     errors = 0
     for kind, url in urls:
         try:
-            with _ydl(proxy, flat) as ydl:
+            with _ydl(proxy, flat, log) as ydl:
                 info = ydl.extract_info(url, download=False)
-        except Exception:  # noqa: BLE001 - a channel with no such tab raises
+        except Exception as e:  # noqa: BLE001 - a channel with no such tab raises
+            log.error(f"{type(e).__name__}: {e}")
             info = None
         if not info or "entries" not in info:
             errors += 1
             continue
-        for e in info["entries"] or []:
-            if e and re.fullmatch(_VIDEO_ID, str(e.get("id") or "")):
+        raw = [e for e in (info["entries"] or []) if e]
+        for e in raw:
+            if re.fullmatch(_VIDEO_ID, str(e.get("id") or "")):
                 out.append(_entry(e, kind, info))
+        note = cut_short(len(raw), info.get("playlist_count"), end, page=30 if job["kind"] == "channel" else 100)
+        if note:
+            job.setdefault("warnings", []).append(f"{url.rsplit('/', 1)[-1] if job['kind'] == 'channel' else 'the playlist'}: {note}")
+    _note_warnings(job, log)
     if errors == len(urls):
-        raise PullError("nothing could be listed: check the address, or the site refused the request")
+        raise _failure(log, proxy, "that address",
+                       "nothing could be listed: check the address, or the site refused the request")
     seen: dict = {}
     for v in out:
         seen.setdefault(v["video_id"], v)
@@ -462,6 +633,59 @@ def fetch_details(video_id: str, proxy: Optional[str]) -> Optional[dict]:
     if e["kind"]:
         out["kind"] = e["kind"]
     return out
+
+
+PROBE_URL = "https://www.youtube.com/"     # the one address proxy_test asks for, a HEAD request
+PROBE_TIMEOUT_S = 10
+
+
+def _probe_send(proxy: str) -> int:
+    """One HEAD request to PROBE_URL through `proxy`. Returns the status the site answered with."""
+    import requests
+    with requests.Session() as s:
+        s.trust_env = False        # never NO_PROXY or a proxy from the environment: this route, or nothing
+        r = s.head(PROBE_URL, proxies={"http": proxy, "https": proxy}, timeout=PROBE_TIMEOUT_S,
+                   allow_redirects=False)
+        return int(r.status_code)
+
+
+def probe_result(exc: Optional[BaseException], status: int = 0) -> str:
+    """ok, login refused (407), unreachable, timeout or error, from what one probe did. The
+    exception is judged by its class names and text, which never leave this function."""
+    if exc is None:
+        return "login refused (407)" if status == 407 else "ok"
+    names = " ".join(c.__name__ for c in type(exc).__mro__).lower()
+    text = f"{names} {exc}".lower()
+    cause = classify([text], "probe")
+    if cause == "proxy_login":
+        return "login refused (407)"
+    if cause == "proxy_setup":
+        return "error: SOCKS needs the PySocks package"
+    if "timeout" in names or "timed out" in text:
+        return "timeout"
+    if any(w in names for w in ("proxyerror", "connectionerror", "oserror")):
+        return "unreachable"
+    return "error"
+
+
+def probe_routes(routes: list, send: Callable = _probe_send) -> list:
+    """proxy_test: one request per route, in parallel (each route is a different exit address).
+    Returns one row per route, as host:port only, in the order of the settings."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(proxy: str) -> dict:
+        row = {"route": config.mask_proxy(proxy)}
+        try:
+            status = send(proxy)
+            row["result"] = probe_result(None, status)
+            row["status"] = status
+        except Exception as e:  # noqa: BLE001 - every outcome is a row, never an error out of the tool
+            row["result"] = probe_result(e)
+            row["error_type"] = type(e).__name__
+        return row
+
+    with ThreadPoolExecutor(max_workers=max(1, min(config.MAX_WORKERS, len(routes)))) as ex:
+        return list(ex.map(one, routes))
 
 
 def fetch_transcript(video_id: str, languages: list, proxy: Optional[str]) -> dict:
@@ -488,6 +712,23 @@ def fetch_transcript(video_id: str, languages: list, proxy: Optional[str]) -> di
 def select_videos(job: dict, listed: list) -> list:
     """The first max_videos as the site lists them, which for a channel is newest first."""
     return list(listed[: job["max_videos"]] if job["max_videos"] else listed)
+
+
+def blocked_message(out: list) -> str:
+    """Why a pull stopped once every route was out. `out` holds (route, last reason) pairs."""
+    tail = " Then pull_resume: videos already stored are skipped."
+    if out == [(None, out[0][1])]:
+        return (f"{BLOCK_STREAK} videos in a row got no answer from the site over your own address. The pull "
+                "stopped rather than keep asking. Wait some hours, or set a proxy in the settings file." + tail)
+    names = ", ".join(f"{config.mask_proxy(r)} ({why})" for r, why in out)
+    if all(why in PROXY_REASONS.values() for _, why in out):
+        return (f"every proxy route was taken out because the proxy itself failed: {names}. "
+                "ProxyLoginRefused means the proxy refused the user name or password; ProxyUnreachable that it "
+                "could not be reached. Check PROXY_URL or PROXY_URLS; proxy_test checks each route." + tail)
+    return (f"every route was taken out after {BLOCK_STREAK} videos in a row got no answer over it: {names}. The "
+            "pull stopped rather than keep asking. Routes the site refused are held back from new pulls for "
+            f"{COOLDOWN_S // 60} minutes. Wait for your proxy provider to give those ports new addresses (with "
+            "sticky sessions that is often within the hour), or wait some hours." + tail)
 
 
 def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = fetch_transcript,
@@ -520,8 +761,20 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
         if own_store:
             store = store_mod.open_store(config.storage_config(settings))
         source = f"{job['kind']}:{job['target']}"
-        log(f"job {job_id}: {source}, routes {[config.mask_proxy(r) for r in routes]}")
-        listed = lister(job, routes[0])
+        held = cooling_routes()
+        usable = [r for r in routes if config.mask_proxy(r) not in held]
+        held_back = sorted({config.mask_proxy(r) for r in routes if config.mask_proxy(r) in held})
+        save(routes_held_back=held_back)
+        log(f"job {job_id}: {source}, routes {[config.mask_proxy(r) for r in usable]}"
+            + (f", held back while they cool down: {held_back}" if held_back else ""))
+        if not usable:
+            save(state="blocked", ended=time.time(),
+                 message="every route is cooling down after the site stopped answering over it. Wait, then resume.")
+            log(job["message"])
+            return job
+        listed = lister(job, usable[0])
+        for w in job.get("warnings") or []:
+            log(f"warning: {w}")
         selected = select_videos(job, listed)
         with lock:
             job["counts"]["listed"], job["counts"]["selected"] = len(listed), len(selected)
@@ -530,6 +783,14 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
 
         queue = list(selected)
         halt = {"state": "", "message": ""}
+        # Routes: each worker holds one, and no route is ever held by two workers at once. Routes
+        # beyond the number of workers stand by. A route over which BLOCK_STREAK videos in a row
+        # got no answer is taken out for the rest of the job, and a standby route, if any is
+        # left, takes its worker over. The job ends blocked only when every route is out.
+        n = min(job["workers"], len(usable), max(1, len(queue)))
+        spare = list(usable[n:])
+        out: list = []                     # (route, the last reason seen over it)
+        reasons_seen: set = set()
 
         def bump(key: str, reason: str = "") -> None:
             with lock:
@@ -538,7 +799,16 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                 if reason:
                     job["failure_reasons"][reason] = job["failure_reasons"].get(reason, 0) + 1
 
-        def one(v: dict, proxy: Optional[str]) -> str:
+        def note(proxy: Optional[str], reason: str, detail: str) -> None:
+            """The first time a reason is seen over a route, say so in the log."""
+            key = (config.mask_proxy(proxy), reason)
+            with lock:
+                if key in reasons_seen:
+                    return
+                reasons_seen.add(key)
+            log(f"over {key[0]}: {reason}: {detail}"[:400])
+
+        def one(v: dict, proxy: Optional[str], last_reason: list) -> str:
             """Handle one video. Returns 'skipped' (nothing was sent), 'answered' (the site gave the
             transcript or a definite no) or 'refused' (it gave neither)."""
             vid = v["video_id"]
@@ -560,6 +830,7 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                     if not extra:
                         store.record_miss(vid, "ViewCountUnavailable", False, source)
                         bump("failed", "ViewCountUnavailable")
+                        last_reason[0] = "ViewCountUnavailable"
                         return "refused"
                     if v["view_count"] < job["min_views"]:
                         bump("skipped_min_views")
@@ -576,17 +847,44 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                     return "answered"
                 except Exception as e:  # noqa: BLE001 - classified by name below
                     last = type(e).__name__
-                    if last in PERMANENT or last in BLOCKED:
+                    cause = classify([f"{last}: {e}"], proxy) if last not in PERMANENT | BLOCKED else ""
+                    if cause in PROXY_REASONS:
+                        last = PROXY_REASONS[cause]
+                    note(proxy, last, explain(cause, proxy, "the video") or config.scrub(f"{e}", settings)[:300])
+                    if last in PERMANENT or last in BLOCKED or last in PROXY_REASONS.values():
                         break              # a definite no, or a refusal: asking again at once helps nobody
                     if attempt < 2:
                         sleep(2.0 * (2 ** attempt))
             permanent = last in PERMANENT
             store.record_miss(vid, last or "Unknown", permanent, source)
             bump("no_transcript" if permanent else "failed", last or "Unknown")
+            last_reason[0] = last or "Unknown"
             return "answered" if permanent else "refused"
 
+        def take_out(proxy: Optional[str], reasons: list) -> Optional[list]:
+            """Take a route out of this job. `reasons` are those of the run of refusals that took it
+            out. Returns [the standby route] to carry on with, [] when there is none for this
+            worker, or None when that was the last route in."""
+            masked = config.mask_proxy(proxy)
+            proxy_only = bool(reasons) and all(r in PROXY_REASONS.values() for r in reasons)
+            reason = reasons[-1] if proxy_only else next(r for r in reversed(reasons) if r not in PROXY_REASONS.values())
+            with lock:
+                out.append((proxy, reason))
+                job["routes_out"] = job.get("routes_out", []) + [masked]
+                last_in = len(out) >= len(usable)
+                nxt = [] if last_in or not spare else [spare.pop(0)]
+            if not proxy_only:
+                cool_down(masked)          # the site refused it at least once: other pulls leave it alone a while
+            log(f"route {masked} taken out: "
+                + (f"the proxy itself failed {BLOCK_STREAK} times in a row ({reason}); the site was not asked"
+                   if proxy_only else f"{BLOCK_STREAK} videos in a row got no answer over it ({reason})")
+                + (f"; {config.mask_proxy(nxt[0])} takes over" if nxt else ""))
+            save()
+            return None if last_in else nxt
+
         def worker(proxy: Optional[str]) -> None:
-            streak = 0                      # this route's own run of videos with no answer
+            streak: list = []               # this route's own run of videos with no answer: their reasons
+            last_reason = [""]
             while True:
                 if halt["state"]:
                     return
@@ -605,48 +903,52 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                         return
                     v = queue.pop(0)
                 try:
-                    outcome = one(v, proxy)
+                    outcome = one(v, proxy, last_reason)
                 except Exception as e:  # noqa: BLE001 - one video must not end the job
                     outcome = "refused"
+                    last_reason[0] = type(e).__name__
                     bump("failed", type(e).__name__)
                     log(f"{v['video_id']}: {type(e).__name__}: {e}")
                 save()
                 if outcome == "answered":
-                    streak = 0
+                    streak = []
                 elif outcome == "refused":
-                    streak += 1
-                    if streak >= BLOCK_STREAK:
-                        with lock:
-                            if not halt["state"]:
-                                halt["state"] = "blocked"
-                                halt["message"] = (
-                                    f"{BLOCK_STREAK} videos in a row got no answer from the site over "
-                                    f"{config.mask_proxy(proxy)}. The pull stopped rather than keep asking. "
-                                    "Wait some hours, or set a proxy, then resume: videos already stored are "
-                                    "skipped.")
-                        return
+                    streak.append(last_reason[0] or "Unknown")
+                    if len(streak) >= BLOCK_STREAK:
+                        nxt = take_out(proxy, streak)
+                        if nxt is None:
+                            with lock:
+                                if not halt["state"]:
+                                    halt["state"] = "blocked"
+                                    halt["message"] = blocked_message(out)
+                            return
+                        if not nxt:
+                            return          # the other workers carry on over their own routes
+                        proxy, streak = nxt[0], []
                 if outcome != "skipped" and queue and not halt["state"]:
                     sleep(job["delay_ms"] / 1000.0)
 
-        n = min(job["workers"], len(routes), max(1, len(queue)))
-        threads = [threading.Thread(target=worker, args=(routes[i],), daemon=True) for i in range(n)]
+        threads = [threading.Thread(target=worker, args=(usable[i],), daemon=True) for i in range(n)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
         c = job["counts"]
         if halt["state"]:
-            if halt["state"] == "blocked":
-                (jobs_dir() / "cooldown.json").write_text(json.dumps(
-                    {"until": time.time() + COOLDOWN_S, "routes": job["routes"]}), encoding="utf-8")
             save(state=halt["state"], message=halt["message"], ended=time.time())
         else:
-            save(state="done", ended=time.time(),
-                 message=f"stored {c['stored']}, already had {c['skipped_existing']}, "
-                         f"no transcript {c['no_transcript'] + c['skipped_known_missing']}, failed {c['failed']}")
+            msg = (f"stored {c['stored']}, already had {c['skipped_existing']}, "
+                   f"no transcript {c['no_transcript'] + c['skipped_known_missing']}, failed {c['failed']}")
+            if out:
+                msg += (f". {len(out)} of {len(usable)} routes were taken out: "
+                        + ", ".join(f"{config.mask_proxy(r)} ({why})" for r, why in out)
+                        + f". The other routes finished the pull. The {BLOCK_STREAK * len(out)} videos that failed over "
+                        "the routes taken out are counted in failed; pull_resume tries them again")
+            save(state="done", ended=time.time(), message=msg)
         log(f"{job['state']}: {job['message']}")
     except PullError as e:
         save(state="failed", message=config.scrub(str(e), settings), ended=time.time())
+        log(f"failed: {e}")
     except Exception as e:  # noqa: BLE001
         save(state="failed", message=config.scrub(f"{type(e).__name__}: {e}", settings), ended=time.time())
         log(f"failed: {type(e).__name__}: {e}")

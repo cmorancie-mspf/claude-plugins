@@ -13,10 +13,10 @@ It knows nothing about any one subject. The same steps work on a surgeon, a poke
 
 > **Read this before you run it.**
 >
-> - It makes automated requests to YouTube from your address: a few to list a channel, then for each video a transcript fetch and, by default, a read of its page for the upload date and view count. Each of those is itself several HTTP requests (about three for a transcript). It is slow on purpose. YouTube may still refuse or throttle an address that asks for a lot; when that happens the pull stops itself and tells you.
+> - It makes automated requests to YouTube from your address: a few to list a channel, then for each video a transcript fetch and, by default, a read of its page for the upload date and view count. Each of those is itself several HTTP requests (about three for a transcript). It is slow on purpose. YouTube may still refuse or throttle an address that asks for a lot; when that happens the pull stops using that address and tells you, and with no other route left it stops.
 > - Whether collecting and studying a channel's transcripts is acceptable for your purpose is your decision. Use it on material you are entitled to study.
 > - Transcripts are strangers' words, and often machine-made captions. Mined items report what was **said**. Nothing here checks whether it is **true**.
-> - **Status: new.** Tried by its author on Windows, on a handful of videos, with SQLite and no proxy. The MongoDB and proxy paths are covered by automated tests of their settings only and have not been run against a live server by this release. Search by meaning, new in 0.3, is tested against a stand-in for the embeddings endpoint only: no real endpoint has been called by this release.
+> - **Status: new.** Tried on Windows with SQLite, without a proxy and, since 0.3.1, through a proxy of 10 ports and with search by meaning through Cloudflare (a first real set-up, whose report led to 0.3.2). The MongoDB path is covered by automated tests of its settings only and has not been run against a live server. The changes of 0.3.2 (routes taken out one at a time, `proxy_test`, the messages that say why a read failed) are tested against stand-ins only. Search by meaning has been run against Cloudflare Workers AI in that set-up; against OpenAI and local servers it is tested with a stand-in only.
 > - Search by meaning is off unless you set it up. If you do, and the endpoint you name is not on your own machine, **the text of your stored transcripts is sent to it**, and so is the wording of every search. Embedding a large corpus may cost money.
 
 ## Use
@@ -80,7 +80,7 @@ Installing copies the skills, the agent and the server, and registers an MCP ser
 | Python 3.9 or later | The server | You install it |
 | `yt-dlp`, `youtube-transcript-api` | Pulling. Search and mining of an existing corpus work without them | `pip install yt-dlp youtube-transcript-api`, into the Python the server uses: `setup_check` prints the exact command |
 | `pymongo` | Only if you choose MongoDB | `pip install pymongo`, into that same Python |
-| `numpy` | Only for search by meaning over more than 2,000 passages | `pip install numpy`, into that same Python: `setup_check` prints the exact command when it is needed |
+| `numpy` | Only for search by meaning over more than 2,000 passages | `pip install numpy`, into that same Python: `setup_check` warns as soon as search by meaning is set up and numpy is missing, and `embed_status` and `embed_start` say so when a run would pass 2,000 |
 
 The server looks for a working Python by trying `py -3` (Windows), `python3` and `python`, and uses the first that reports version 3.9 or later. To choose one, set `EXPERTISE_MINER_PYTHON` to its full path in your environment.
 
@@ -111,12 +111,14 @@ Settings are read from your environment, or from a file named `.env` in the data
 | `PROXY_URL` | One proxy: `scheme://user:password@host:port` | None |
 | `PROXY_PORT_COUNT` | Use this many consecutive ports of `PROXY_URL` as separate routes | 1 |
 | `PROXY_URLS` | A comma-separated list of proxies, used in place of `PROXY_URL` | |
+| `EXPERTISE_MINER_WORKERS` | Workers for a pull that does not say. Still never more than the routes, at most 8 | 1 |
+| `EXPERTISE_MINER_DELAY_MS` | The pause per worker for a pull that does not say. Still never under 500 | 1500 |
 | `EXPERTISE_MINER_EMBED_URL` | Search by meaning: the base address of an OpenAI-compatible embeddings API, the part before `/embeddings` | None: off |
 | `EXPERTISE_MINER_EMBED_MODEL` | The embedding model's name, as that endpoint spells it | None |
 | `EXPERTISE_MINER_EMBED_KEY` | Sent to that endpoint as a bearer token. Leave out for a local server | None |
 | `EXPERTISE_MINER_EMBED_BATCH` | Passages per request, 1 to 256 | 32 |
 
-The four `EXPERTISE_MINER_EMBED_` settings are read as a set: from the environment if it holds any of them, otherwise from `.env`.
+The four `EXPERTISE_MINER_EMBED_` settings are read as a set: from the environment if it holds any of them, otherwise from `.env`. A value of `workers` or `delay_ms` given on a pull wins over `EXPERTISE_MINER_WORKERS` and `EXPERTISE_MINER_DELAY_MS`; `pull_resume` keeps what the earlier pull was given and otherwise takes these settings as they are then. `setup_check` shows what a pull would run with (`pull_defaults`).
 
 ### Search
 
@@ -148,7 +150,7 @@ Word search cannot find "how much I put in play each night" for a search about b
 | Cloudflare Workers AI | `https://api.cloudflare.com/client/v4/accounts/<your account id>/ai/v1` | For example `@cf/baai/bge-m3` | An API token of that account |
 | OpenAI | `https://api.openai.com/v1` | For example `text-embedding-3-small` | An API key |
 
-The addresses and names in this table were read from each provider's documentation in November 2026. **None of the three has been called by this release**: the code is tested against a stand-in only. Model names come and go; take the current one from your provider's list.
+The addresses and names in this table were read from each provider's documentation in November 2026. **Of the three, only Cloudflare has been called for real** (in a user's set-up of 0.3.1); the others are tested against a stand-in only. Model names come and go; take the current one from your provider's list.
 
 To use it:
 
@@ -170,7 +172,7 @@ What it does, as built:
 | When the endpoint refuses during a job | A refused key (HTTP 401 or 403) ends the job at once. "Slow down", a server error or no answer is tried again up to 5 times, waiting 2, 4, 8 and 16 seconds or as long as the endpoint asks, at most 2 minutes; then the job ends `blocked`. A batch the endpoint will not take is sent again one passage at a time, and a passage refused alone is left out and counted. While the endpoint has never embedded anything for this corpus, 5 of those in a row end the job: that is usually a wrong model name or address. (If it is really the first few passages of the corpus that the endpoint cannot take, the job cannot get past them.) Once the endpoint has embedded something, a passage it refuses is remembered and later runs go past it (`retry_refused: true` on `embed_start` sends them again); 50 refusals in a row end the job and are not remembered, because that many points at the endpoint and not at the passages. A passage is remembered by its place in the index, so pulling its video again sends it once more. Each step of a request is given 60 seconds, as for a search. A stop request is seen when the request in hand returns, or when a wait between retries ends |
 | Pause after each request | 0.2 s, `delay_ms` on `embed_start`, never under 0.1 s. 32 passages per request, `EXPERTISE_MINER_EMBED_BATCH`. If your endpoint takes fewer texts per request than that, every batch is refused and re-sent one passage at a time, which works but wastes a request per batch; the job's log says so, and a smaller batch setting avoids it |
 | Pulling a video again, rebuilding the index | A passage whose text is unchanged keeps its vector. One whose text changed loses it and is embedded by the next run |
-| `numpy` | Needed to rank more than 2,000 vectors; `setup_check` then prints the install command. Below that, plain Python is used and nothing need be installed, and is slower: measured on one machine, 0.05 s for 500 vectors of 1,024 numbers and one wording, growing in proportion to vectors times wordings, so over a second for 2,000 vectors and 8 wordings. The server answers nothing else meanwhile |
+| `numpy` | Needed to rank more than 2,000 vectors. `setup_check` warns, with the install command, as soon as embeddings are set and numpy is missing; `embed_status` and `embed_start` add a `numpy_notice` when the stored vectors plus those a run would make pass 2,000. Below that, plain Python is used and nothing need be installed, and is slower: measured on one machine, 0.05 s for 500 vectors of 1,024 numbers and one wording, growing in proportion to vectors times wordings, so over a second for 2,000 vectors and 8 wordings. The server answers nothing else meanwhile |
 
 What to know before relying on it:
 
@@ -192,9 +194,18 @@ A collection written by another tool can be read as it is, as long as each recor
 
 ### Proxies, and why workers are capped
 
-By default one worker fetches one video at a time from your own address. More workers only help when each has its own exit address; two workers behind one address just double what that address sends. So the number of workers is never more than the number of distinct routes: one without a proxy, `PROXY_PORT_COUNT` with a port range, or the length of `PROXY_URLS`. At most 8.
+By default one worker fetches one video at a time from your own address. More workers only help when each has its own exit address; two workers behind one address just double what that address sends. So the number of workers is never more than the number of distinct routes: one without a proxy, `PROXY_PORT_COUNT` with a port range, or the length of `PROXY_URLS`. At most 8. Each worker holds one route, and no route is used by two workers at once.
 
-Any HTTP or SOCKS5 proxy works. One common arrangement is a provider that gives a different exit address on each port of one gateway; for that, set `PROXY_URL` to the first port and `PROXY_PORT_COUNT` to how many you may use. For example a mobile proxy from Decodo, with ports 10001 upward, is `PROXY_URL=http://USER:PASS@gate.decodo.com:10001` and `PROXY_PORT_COUNT=4`.
+Routes beyond a pull's workers stand by. When five videos in a row get no answer over a route, that route is taken out for the rest of the pull, and a standby route, if one is left, takes its worker over; otherwise that worker stops and the others carry on. The pull ends `blocked` only when every route is out. `pull_status` lists the routes taken out (`routes_out`).
+
+Any HTTP or SOCKS5 proxy works. One common arrangement is a provider that gives a different exit address on each port of one gateway; for that, set `PROXY_URL` to the first port and `PROXY_PORT_COUNT` to how many you may use: `PROXY_URL=http://USER:PASS@gate.example.com:10001` with `PROXY_PORT_COUNT=10` is ports 10001 to 10010, ten routes. Decodo's mobile proxies are one such provider.
+
+Two things that trip people up when writing the address:
+
+- **The order.** It is `scheme://user:password@host:port`. Providers often export `host:port:user:pass`; `setup_check` recognises that order and says how to rewrite it, without repeating the user name or password.
+- **Characters in the password.** If the user name or password holds `@ : / # ?` or `%`, write them as `%40 %3A %2F %23 %3F %25`. Other characters, such as `=`, can stay as they are. Both libraries that pull decode these before sending them to the proxy: checked for 0.3.2 against yt-dlp 2026.10.26 (its requests handler and its SOCKS code), requests 2.34.2 (which youtube-transcript-api uses, for HTTP and SOCKS proxies) and Python's own urllib (yt-dlp's fallback), by asking each what it would send, with no proxy contacted. A raw `@` in the password is refused by `setup_check` with that advice.
+
+`setup_check` checks the address's form only; it contacts nothing. To check that each route actually works, `proxy_test` sends one `HEAD` request to `https://www.youtube.com/` through each configured route (with a 10-second timeout, up to 8 routes at once) and reports each as `host:port` only: `ok`, `login refused (407)`, `unreachable`, `timeout` or `error`. It never sends anything from your own address: with no proxy set, it sends nothing. Claude runs it only when you agree. When a pull fails because the proxy refused the login or could not be reached, the message and the job's log say so, naming the route as `host:port`.
 
 Proxy addresses are shown as `host:port` only, in tool results and job records. Error text is passed through a filter before it is logged, recorded or returned: it removes the configured proxy and MongoDB addresses, the user name and password inside them, and the user-and-password part of any other URL. The embeddings key and address are removed in the same way (the address whole, its path alone, and any piece of the path of six or more characters that holds a digit, such as an account id), and so is whatever follows the word `Bearer`. It matches those known values and those shapes; a credential that turned up in an error in some other form would get through. Anything the worker process itself prints on a crash goes to its log file unfiltered.
 
@@ -202,21 +213,23 @@ Proxy addresses are shown as `host:port` only, in tool results and job records. 
 
 | Behaviour | Value | Can it be changed |
 |---|---|---|
-| Pause after each video, per worker | 1.5 s | Yes, `delay_ms`; never below 0.5 s |
-| Workers | 1 | Yes, up to the number of routes, at most 8 |
+| Pause after each video, per worker | 1.5 s | Yes, `delay_ms` on a pull or `EXPERTISE_MINER_DELAY_MS`; never below 0.5 s |
+| Workers | 1 | Yes, `workers` on a pull or `EXPERTISE_MINER_WORKERS`; up to the number of routes, at most 8 |
 | Videos per pull | 50, newest first | Yes, `max_videos`; 0 is the whole channel |
 | Pulls running at once | 1 per data folder | No |
 | Asking again for a video already stored | Never, unless `refresh` | |
 | Asking again for a video known to have no captions | Never, unless `retry_missing` | |
-| Five videos in a row, on one route, that got neither a transcript nor a definite "none" | The pull stops as `blocked`, and no new pull starts over any route that pull was using for 30 minutes | No |
+| Five videos in a row, on one route, that got neither a transcript nor a definite "none" | That route is taken out for the rest of the pull, and a standby route takes over if one is left. The pull stops as `blocked` when every route is out. Without a proxy there is one route, so the pull stops | No |
+| A route the site refused | Held back from new pulls for 30 minutes. Only that route: a new pull uses the others and says which it held back, and is refused only when every one of its routes is held back. A route is not held back only when every one of the five failures that took it out was the proxy's own (it refused the login, could not be reached, or SOCKS support is missing), since the site was then never asked | No |
 
 The pause is between videos, not between HTTP requests. A video takes a transcript fetch and, by default, a read of its page for the upload date and view count, which a channel listing does not carry; `details: false` leaves the second out. Listing a channel is not paced. A failed transcript fetch is retried twice, after 2 and 4 seconds, unless the site said the video has no transcript or refused the address.
 
-These limits are per pull and per data folder. Nothing stops someone from running a second data folder, or starting again 30 minutes after a block; the limits make the polite thing the default, they do not make the impolite thing impossible.
+These limits are per pull and per data folder. Nothing stops someone from running a second data folder, or starting again 30 minutes after a block; the limits make the polite thing the default, they do not make the impolite thing impossible. Routes are told apart for the cool-down by `host:port`, so two routes on the same host and port with different user names (a provider's sticky sessions, say) are held back together.
 
 ## What leaves your machine
 
 - Requests to YouTube for listings and transcripts, from your address or through the proxy you set.
+- If you agree to `proxy_test`: one `HEAD` request to `https://www.youtube.com/` through each proxy route you set, and nothing else.
 - If you chose MongoDB, the transcripts go to your MongoDB server.
 - If you set an embeddings endpoint: the text of stored passages goes to it when you run `embed_start`, and the wording of each search goes to it when you search. If that endpoint is a server on your own machine, this stays on your machine. If it is a hosted service, your transcripts' text and your searches go to that service. The settings table and the section on search by meaning say exactly what is sent.
 - Nothing else is sent anywhere by the server. It has no telemetry. It calls no model except that embeddings endpoint, and only when you have set one.
@@ -226,7 +239,8 @@ These limits are per pull and per data folder. Nothing stops someone from runnin
 
 | Tool | Does |
 |---|---|
-| `setup_check` | Reports Python, packages, storage, routes, the embeddings settings (never the key), and the three choices in effect. Contacts nothing, except your own MongoDB server when that is the store |
+| `setup_check` | Reports Python, packages, storage, routes, the pull defaults, the embeddings settings (never the key), the three choices in effect, the age of the installed yt-dlp and whether a JavaScript runtime is found, and `warnings` that need no action yet. Contacts nothing, except your own MongoDB server when that is the store |
+| `proxy_test` | Optional: one request through each proxy route, to say which work. Run only when you agree |
 | `setup_write` | Writes the settings file from answers to the three questions, with placeholders where a secret goes. Never overwrites one |
 | `pull_channel`, `pull_playlist` | Start a pull in its own process and return a job id |
 | `pull_video` | Pulls one video and waits up to 45 seconds for it |
@@ -254,6 +268,8 @@ The mining tools write only inside the run folder they are given, under fixed na
 - **A channel listing is newest first.** There is no "most viewed first"; `min_views` filters within the videos selected.
 - **A pull that dies** (the machine slept, the process was killed) is noticed when its record has not been updated for 90 seconds. What it stored is kept, and `pull_resume` continues. A worker that was only frozen stands down when it wakes and finds that another pull has taken its place.
 - **Members-only, private and age-restricted videos** are not fetched. No sign-in or cookies are used.
+- **An out-of-date yt-dlp fails quietly.** One about 240 days old was seen to list only the first 100 videos of a 175-video playlist, with no error. `setup_check` reports yt-dlp's age (a warning past 60 days, a problem past 90) with the upgrade command, and a pull whose listing stops at a whole page, or short of the count the site gives, says in its `warnings` that it may have been cut short. Neither can be sure: a playlist of exactly 100 videos is reported too. yt-dlp's own warnings are passed on in `warnings` as well.
+- **yt-dlp wants a JavaScript runtime** (Deno) for YouTube, and says reading it without one is deprecated. `setup_check` warns when none is on the PATH. Transcripts come through another library and do not need it today.
 
 ## Removing it
 

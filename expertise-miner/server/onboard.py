@@ -179,26 +179,47 @@ def render(c: dict) -> tuple:
         "",
         "# --- Choice A: no proxy (ON while every line below is off) " + "-" * 31,
         "",
+        "# Writing a proxy address, for choices B and C:",
+        "# - The order is scheme://USER:PASSWORD@HOST:PORT. Providers often export host:port:user:pass;",
+        "#   reorder it: gate.example.com:10001:me:pw becomes http://me:pw@gate.example.com:10001",
+        "# - If the user name or password holds @ : / # ? or %, write them as %40 %3A %2F %23 %3F %25.",
+        "#   Other characters, such as =, can stay as they are. Both pulling libraries decode these.",
+        "",
         "# --- Choice B: one proxy address (off) " + "-" * 51,
         "# http, https, socks5 or socks5h.",
         "# PROXY_URL=http://USER:PASSWORD@HOST:PORT",
         "# How many consecutive ports of that address to use as separate routes, 1 to 64. Each route",
-        "# carries one worker. Raise it only if your proxy plan gives you that many ports.",
+        "# is one exit address. Raise it only if your proxy plan gives you that many ports. For",
+        "# example, PROXY_URL=http://USER:PASSWORD@gate.example.com:10001 with PROXY_PORT_COUNT=10",
+        "# gives ports 10001 to 10010: 10 routes. This is the short way for a provider that gives one",
+        "# exit address per port.",
         "# PROXY_PORT_COUNT=1",
         "",
         "# --- Choice C: a list of proxies (off) " + "-" * 51,
-        "# Comma-separated. When set, the lines of choice B are ignored.",
+        "# Comma-separated, one route each. When set, the lines of choice B are ignored. If your",
+        "# routes are one host on consecutive ports, choice B says the same in two lines.",
         "# PROXY_URLS=http://USER:PASSWORD@HOST1:PORT,http://USER:PASSWORD@HOST2:PORT",
         "",
         "# A proxy is for YouTube only. Search by meaning never uses it.",
         "",
+        "# --- How fast pulls go (off: the built-in defaults) " + "-" * 39,
+        "# The defaults for a pull that does not say: workers 1, a pause of 1500 ms per worker.",
+        "# A value given on a pull wins. The limits stay whatever is set here: never more workers",
+        "# than routes, at most 8, and never a pause under 500 ms. With no proxy, one worker runs.",
+        "# A safe start with a proxy plan of several ports: 4 workers and 3000 ms.",
+        "# EXPERTISE_MINER_WORKERS=4",
+        "# EXPERTISE_MINER_DELAY_MS=3000",
+        "",
         RULE,
         "# NOT IN THIS FILE",
         RULE,
-        "# Two settings can only be environment variables (then start a new Claude Code session):",
-        "# EXPERTISE_MINER_HOME     the data folder. Default: .expertise-miner in your home folder.",
-        "# EXPERTISE_MINER_PYTHON   the Python the server runs under. Default: the first of py -3,",
-        "#                          python3, python that is version 3.9 or later.",
+        "# Two more settings exist, and neither can be set here: they are read before this file is.",
+        "# Set them as environment variables of your system if you need them, then start a new",
+        "# Claude Code session. Nothing to fill in or switch on in this file.",
+        "#   The data folder: environment variable EXPERTISE_MINER_HOME. Default: .expertise-miner",
+        "#   in your home folder.",
+        "#   The Python the server runs under: environment variable EXPERTISE_MINER_PYTHON. Default:",
+        "#   the first of py -3, python3, python that is version 3.9 or later.",
         "",
     ]
     if mongo:
@@ -213,10 +234,13 @@ def render(c: dict) -> tuple:
                     "how much embed_start would send.")
     if proxy == "one":
         todo.append("Proxy (section 3, choice B): replace USER, PASSWORD, HOST and PORT in PROXY_URL and remove its "
-                    "\"# \". Until then pulls go out from your own address.")
+                    "\"# \". If the plan gives one exit address per port, also set PROXY_PORT_COUNT. Until then pulls "
+                    "go out from your own address. The file says how to write a password holding @ : / # ? or %.")
     if proxy == "list":
         todo.append("Proxies (section 3, choice C): replace the example addresses in PROXY_URLS with your own and "
-                    "remove its \"# \". Until then pulls go out from your own address.")
+                    "remove its \"# \". If they are one host on consecutive ports, choice B (PROXY_URL with "
+                    "PROXY_PORT_COUNT) is the shorter way. Until then pulls go out from your own address. The file "
+                    "says how to write a password holding @ : / # ? or %.")
     return "\n".join(L), todo
 
 

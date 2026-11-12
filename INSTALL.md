@@ -33,7 +33,7 @@ Say them plainly; do not bury them.
 
 **`expertise-miner`**
 
-- It makes automated requests to YouTube from this machine's address, or through a proxy the person sets up. It is slow by default and stops itself when YouTube refuses it. Whether that use is acceptable is the person's decision.
+- It makes automated requests to YouTube from this machine's address, or through a proxy the person sets up. It is slow by default. When YouTube refuses an address it stops using it, and stops the pull when no other proxy route is left (without a proxy, at once). Whether that use is acceptable is the person's decision.
 - It registers an MCP server, `expertise-miner`, in every Claude Code session.
 - It needs Python packages for pulling, installed only with the person's agreement.
 - Transcripts are stored in a file in the person's home folder. Transcript text you read enters the conversation.

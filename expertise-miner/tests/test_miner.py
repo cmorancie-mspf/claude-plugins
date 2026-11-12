@@ -7,6 +7,7 @@ test works in its own temporary data folder. No test opens a connection.
 """
 from __future__ import annotations
 
+import contextlib
 import email.message
 import io
 import json
@@ -583,25 +584,49 @@ class PullTests(Base):
         last = pull.list_jobs(1)[0]
         self.assertEqual((last["state"], last["counts"]["failed"]), ("blocked", pull.BLOCK_STREAK))
 
-    def test_a_refused_route_is_stopped_even_while_another_route_works(self):
-        os.environ["PROXY_URLS"] = "http://good.example:1,http://bad.example:2"
-        seen = {"good": 0, "bad": 0}
+    def test_a_refused_route_is_taken_out_and_the_others_finish_the_pull(self):
+        # 0.3.2, on the owner's instruction: one refused route no longer stops the pull. It is taken
+        # out for the rest of the job, and the job ends blocked only when every route is out.
+        os.environ["PROXY_URLS"] = "http://good.example:1,http://bad.example:2,http://also.example:3"
+        seen = {"good": 0, "bad": 0, "also": 0}
+        live: dict = {}
+        top = {"max": 0}
+        guard = __import__("threading").Lock()
 
-        class IpBlocked(Exception):
+        class RequestBlocked(Exception):
             pass
 
         def fetcher(vid, langs, proxy):
-            if "bad" in proxy:
-                seen["bad"] += 1
-                raise IpBlocked()
-            seen["good"] += 1
-            time.sleep(0.002)
-            return {"segments": SEGS, "language": "en", "is_generated": True}
+            name = proxy.split("//")[1].split(".")[0]
+            with guard:
+                live[name] = live.get(name, 0) + 1
+                top["max"] = max(top["max"], live[name])               # never two workers on one route
+                seen[name] += 1
+            try:
+                time.sleep(0.001)
+                if name == "bad":
+                    raise RequestBlocked()
+                return {"segments": SEGS, "language": "en", "is_generated": True}
+            finally:
+                with guard:
+                    live[name] -= 1
 
-        job = self.run_job(self.job(workers=2, details=False), [f"{i:011d}" for i in range(400)], fetcher)
-        self.assertEqual((job["workers"], job["state"]), (2, "blocked"))
-        self.assertEqual(seen["bad"], pull.BLOCK_STREAK)               # the working route did not excuse it
+        jid = self.job(workers=3, details=False, max_videos=0)
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):                      # the worker's log is its stdout
+            job = self.run_job(jid, [f"{i:011d}" for i in range(60)], fetcher)
+        self.assertIn("route bad.example:2 taken out", printed.getvalue())
+        self.assertEqual((job["workers"], job["state"]), (3, "done"))
+        self.assertEqual(seen["bad"], pull.BLOCK_STREAK)               # it was not asked again after it was out
+        self.assertEqual(job["counts"]["stored"], 60 - pull.BLOCK_STREAK, (job["counts"], job["failure_reasons"]))
+        self.assertEqual(top["max"], 1)
+        self.assertEqual(job["routes_out"], ["bad.example:2"])
         self.assertIn("bad.example:2", job["message"])
+        import server as server_mod
+        view = server_mod._job_view(pull.read_job(jid))
+        self.assertEqual(view["routes_out"], ["bad.example:2"])        # pull_status lists it
+        self.assertEqual(pull.check_cooldown(pull.build_job({"kind": "video", "target": VID_A})),
+                         ["bad.example:2"])                            # held back from the next pull, alone
 
     def test_a_job_record_cannot_ask_for_more_workers_than_routes(self):
         jid = self.job(details=False)
@@ -663,6 +688,495 @@ class PullTests(Base):
         pull.write_job(dead)
         self.assertEqual(pull.effective_state(pull.read_job(first)), "died")
         pull._acquire_slot(self.job())
+
+
+class FieldReportTests(Base):
+    """0.3.2: the eleven issues of the first real set-up, each by its acceptance check."""
+
+    def tearDown(self):
+        import server as server_mod
+        if server_mod._store is not None:
+            server_mod._store.close()
+            server_mod._store = None
+        super().tearDown()
+
+    # ---- issue 3 and 4: how a proxy address is written ------------------------------
+
+    def test_the_export_order_is_refused_with_a_reorder_message_that_repeats_no_credential(self):
+        for url in ("gate.decodo.com:10001:u:p", "http://gate.decodo.com:10001:u:p",
+                    "gate.example.com:10001:someuser:s3cr3tpw"):
+            os.environ["PROXY_URL"] = url
+            with self.assertRaises(ValueError) as cm:
+                config.proxy_routes()
+            msg = str(cm.exception)
+            self.assertIn("host:port:user:pass", msg)
+            self.assertIn("USER:PASSWORD@", msg)
+            for piece in re.split(r"[:/]+", url.split(":", 2)[-1]):
+                if piece and not piece.isdigit():
+                    self.assertNotRegex(msg, rf"(?<![A-Za-z]){re.escape(piece)}(?![A-Za-z])", (url, piece))
+        del os.environ["PROXY_URL"]
+        os.environ["PROXY_URLS"] = "http://gate.example:10001:u:pw1,http://gate.example:10002:u:pw1"
+        with self.assertRaisesRegex(ValueError, "host:port:user:pass"):
+            config.proxy_routes()
+
+    def test_a_raw_at_sign_or_a_raw_hash_in_the_password_is_refused_and_the_fix_is_named(self):
+        for url in ("http://me:pa@ss@gate.example:10001", "http://me:12#ab@gate.example:10001",
+                    "http://me:pa/ss@gate.example:10001"):
+            os.environ["PROXY_URL"] = url
+            with self.assertRaises(ValueError, msg=url) as cm:
+                config.proxy_routes()
+            self.assertIn("%40", str(cm.exception))
+            for secret in ("pa@ss", "12#ab", "pa/ss"):
+                self.assertNotIn(secret, str(cm.exception))
+        os.environ["PROXY_URL"] = "http://me:p%40ss%3Dw%3A@gate.example:10001"   # written as the file says
+        os.environ["PROXY_PORT_COUNT"] = "2"
+        self.assertEqual(config.proxy_routes(), ["http://me:p%40ss%3Dw%3A@gate.example:10001",
+                                                 "http://me:p%40ss%3Dw%3A@gate.example:10002"])
+        self.assertNotIn("p@ss=w:", config.scrub("refused me:p@ss=w: at gate.example"))   # decoded form is hidden too
+        os.environ["PROXY_URL"] = "http://me:a=b@gate.example:10001"            # = needs no encoding
+        self.assertEqual(len(config.proxy_routes()), 2)
+
+    def test_both_pulling_libraries_decode_an_encoded_password(self):
+        # Stand-ins only: no connection is opened. Each library is asked what credentials it
+        # would send for an address; skipped where a library is not installed.
+        url = "http://us%40er:p%3Dw%40x%3A%2F%23%25@proxy.invalid:10001"
+        want = "us@er:p=w@x:/#%"
+        import base64
+        try:
+            import requests.adapters
+        except ImportError:
+            self.skipTest("requests is not installed")
+        got = requests.adapters.HTTPAdapter().proxy_headers(url)["Proxy-Authorization"]
+        self.assertEqual(base64.b64decode(got.split()[1]).decode(), want)       # youtube-transcript-api's path
+        try:
+            from yt_dlp.networking._helper import make_socks_proxy_opts
+            from yt_dlp.networking._requests import RequestsHTTPAdapter
+        except ImportError:
+            self.skipTest("yt-dlp is not installed")
+        got = RequestsHTTPAdapter().proxy_headers(url)["Proxy-Authorization"]
+        self.assertEqual(base64.b64decode(got.split()[1]).decode(), want)       # yt-dlp over http(s)
+        o = make_socks_proxy_opts(url.replace("http://", "socks5://"))
+        self.assertEqual(f"{o['username']}:{o['password']}", want)               # yt-dlp over socks
+
+    # ---- issue 1: a failed read says why -----------------------------------------------
+
+    def fake_ydl(self, errors=(), info=None, warnings=()):
+        test = self
+
+        class Fake:
+            def __init__(self, proxy, extra, logger=None):
+                self.logger = logger
+                test.ydl_proxies.append(proxy)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                for w in warnings:
+                    self.logger.warning(w)
+                for e in errors:
+                    self.logger.error(e)
+                return info
+
+        self.ydl_proxies = []
+        real = pull._ydl
+        self.addCleanup(setattr, pull, "_ydl", real)
+        pull._ydl = Fake
+
+    def test_a_refused_proxy_login_is_named_and_not_called_a_private_video(self):
+        os.environ["PROXY_URL"] = "http://someone:wrongpw99@gate.example:10001"
+        proxy = config.proxy_routes()[0]
+        cases = {
+            "ERROR: [youtube] x: Unable to download API page: ('Unable to connect to proxy', OSError('Tunnel "
+            "connection failed: 407 Proxy Authentication Required'))": "refused the login",
+            "ERROR: Unable to download webpage: <urlopen error Tunnel connection failed: 502 Bad Gateway> "
+            "(caused by ProxyError())": "could not be reached",
+            "ERROR: [youtube] x: Sign in to confirm you're not a bot": "not a bot",
+            "ERROR: [youtube] x: Private video. Sign in if you've been granted access": "private, removed",
+            "ERROR: [youtube] x: Video unavailable. This video has been removed by the uploader": "private, removed",
+            "ERROR: [youtube] x: The uploader has not made this video available in your country": "country",
+        }
+        for message, expected in cases.items():
+            self.fake_ydl(errors=[message])
+            job = pull.build_job({"kind": "video", "target": VID_A})
+            with self.assertRaises(pull.PullError, msg=message) as cm:
+                pull.list_videos(job, proxy)
+            text = str(cm.exception)
+            self.assertIn(expected, text, message)
+            for secret in ("someone", "wrongpw99"):
+                self.assertNotIn(secret, text)
+            if "proxy" in expected or "login" in expected:
+                self.assertIn("gate.example:10001", text)
+        self.fake_ydl(errors=[f"ERROR: something new at http://someone:wrongpw99@gate.example:10001"])
+        with self.assertRaises(pull.PullError) as cm:                 # an unknown cause: yt-dlp's words, filtered
+            pull.list_videos(pull.build_job({"kind": "video", "target": VID_A}), proxy)
+        self.assertIn("something new", str(cm.exception))
+        self.assertNotIn("wrongpw99", str(cm.exception))
+        self.fake_ydl(errors=["ERROR: 407 Proxy Authentication Required"])
+        with self.assertRaises(pull.PullError) as cm:                 # with no proxy, a proxy is never blamed
+            pull.list_videos(pull.build_job({"kind": "video", "target": VID_A}), None)
+        self.assertNotIn("proxy", str(cm.exception).split("yt-dlp said")[0])
+
+    def test_the_reason_reaches_the_job_record_and_the_log_with_no_credential(self):
+        os.environ["PROXY_URL"] = "http://someone:wrongpw99@gate.example:10001"
+        self.fake_ydl(errors=["ERROR: Tunnel connection failed: 407 Proxy Authentication Required"])
+        job = pull.build_job({"kind": "playlist", "target": "PLabcdefgh1234"})
+        pull.write_job(job)
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            done = pull.run_job(job["id"], fetcher=None, detailer=None, sleep=lambda s: None)
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("refused the login", done["message"])
+        self.assertIn("refused the login", printed.getvalue())
+        for text in (printed.getvalue(), (pull.jobs_dir() / f"{job['id']}.json").read_text(encoding="utf-8")):
+            self.assertNotIn("wrongpw99", text)
+            self.assertNotIn("someone", text)
+
+    def test_a_transcript_refused_by_the_proxy_is_counted_as_such_and_not_held_against_the_route(self):
+        os.environ["PROXY_URLS"] = "http://u:badpw123@a.example:1,http://u:badpw123@b.example:2"
+
+        class ProxyError(Exception):
+            pass
+
+        def fetcher(vid, langs, proxy):
+            raise ProxyError("HTTPSConnectionPool: Max retries exceeded (Caused by ProxyError('Unable to connect "
+                             "to proxy', OSError('Tunnel connection failed: 407 Proxy Authentication Required')))")
+
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert", "workers": 2, "details": False})
+        pull.write_job(job)
+        lister = PullTests.lister([f"{i:011d}" for i in range(30)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = pull.run_job(job["id"], lister=lister, fetcher=fetcher, detailer=None, sleep=lambda s: None)
+        self.assertEqual(done["state"], "blocked")
+        self.assertEqual(done["failure_reasons"], {"ProxyLoginRefused": 2 * pull.BLOCK_STREAK})
+        self.assertIn("refused the user name or password", done["message"])
+        self.assertEqual(pull.cooling_routes(), {})                   # the site did nothing: no cool-down
+        self.assertNotIn("badpw123", json.dumps(done))
+
+    # ---- issue 9: routes, not the whole pull --------------------------------------------
+
+    def run_routes(self, urls, bad, n=40, workers=8, **spec):
+        os.environ["PROXY_URLS"] = ",".join(urls)
+        used = []
+
+        class RequestBlocked(Exception):
+            pass
+
+        def fetcher(vid, langs, proxy):
+            used.append(config.mask_proxy(proxy))
+            if any(b in proxy for b in bad):
+                raise RequestBlocked()
+            time.sleep(0.003)              # a working route takes a moment, so every worker gets its turn
+            return {"segments": SEGS, "language": "en", "is_generated": True}
+
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert", "workers": workers, "details": False,
+                              "max_videos": 0, **spec})
+        job["routes_held_back"] = pull.check_cooldown(job)
+        pull.write_job(job)
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = pull.run_job(job["id"], lister=PullTests.lister([f"{i:011d}" for i in range(n)]),
+                                fetcher=fetcher, detailer=None, sleep=lambda s: None)
+        return done, used
+
+    def test_a_standby_route_takes_over_from_one_that_is_taken_out(self):
+        done, used = self.run_routes(["http://a.example:1", "http://b.example:2", "http://c.example:3"],
+                                     bad=["a.example"], workers=2)
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(done["routes_out"], ["a.example:1"])
+        self.assertIn("c.example:3", used)                             # the standby was used
+        self.assertEqual(used.count("a.example:1"), pull.BLOCK_STREAK)
+        self.assertEqual(done["counts"]["stored"], 40 - pull.BLOCK_STREAK)
+
+    def test_only_when_every_route_is_out_does_the_pull_end_blocked(self):
+        done, used = self.run_routes(["http://a.example:1", "http://b.example:2"], bad=["example"])
+        self.assertEqual(done["state"], "blocked")
+        self.assertEqual(len(used), 2 * pull.BLOCK_STREAK)
+        self.assertEqual(sorted(done["routes_out"]), ["a.example:1", "b.example:2"])
+        for r in ("a.example:1", "b.example:2"):
+            self.assertIn(r, done["message"])
+        self.assertNotIn("set a proxy", done["message"])               # a proxy is already set
+        self.assertIn("proxy provider", done["message"])
+        self.assertIn("resume", done["message"])
+        with self.assertRaisesRegex(pull.PullError, "every proxy route"):
+            pull.create_job({"kind": "video", "target": VID_A})
+
+    def test_the_cool_down_holds_back_only_the_routes_that_were_refused(self):
+        self.run_routes(["http://a.example:1", "http://b.example:2", "http://c.example:3"], bad=["b.example"])
+        self.assertEqual(set(pull.cooling_routes()), {"b.example:2"})
+        done, used = self.run_routes(["http://a.example:1", "http://b.example:2", "http://c.example:3"], bad=[])
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(done["routes_held_back"], ["b.example:2"])
+        self.assertNotIn("b.example:2", used)                          # a route cooling down is left alone
+        self.assertTrue(set(used) <= {"a.example:1", "c.example:3"} and used)
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        job = pull.build_job({"kind": "video", "target": VID_A})
+        self.assertEqual(pull.check_cooldown(job), ["b.example:2"])
+
+    def test_a_route_the_site_refused_even_once_in_the_run_is_cooled(self):
+        os.environ["PROXY_URLS"] = "http://u:pw12345@a.example:1,http://u:pw12345@b.example:2"
+        calls = {"n": 0}
+
+        class RequestBlocked(Exception):
+            pass
+
+        class ProxyError(Exception):
+            pass
+
+        def fetcher(vid, langs, proxy):
+            if "b.example" in proxy:
+                time.sleep(0.003)
+                return {"segments": SEGS, "language": "en", "is_generated": True}
+            calls["n"] += 1
+            if calls["n"] < pull.BLOCK_STREAK:
+                raise RequestBlocked()
+            raise ProxyError("Unable to connect to proxy: Tunnel connection failed: 502")
+
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert", "workers": 2, "details": False})
+        pull.write_job(job)
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = pull.run_job(job["id"], lister=PullTests.lister([f"{i:011d}" for i in range(30)]),
+                                fetcher=fetcher, detailer=None, sleep=lambda s: None)
+        self.assertEqual(done["routes_out"], ["a.example:1"])
+        self.assertIn("a.example:1", pull.cooling_routes())           # four site refusals: cooled, whatever came last
+        self.assertIn("a.example:1 (RequestBlocked)", done["message"])
+        self.assertIn("pull_resume tries them again", done["message"])
+
+    def test_words_that_only_look_like_a_proxy_failure_do_not_blame_it(self):
+        p = "socks5h://u:pw@gate.example:1080"
+        self.assertEqual(pull.classify(["ERROR: [youtube] ab407cdEfgh: Video unavailable. This video is private"], p),
+                         "unavailable")
+        self.assertEqual(pull.classify(["429 Client Error: Too Many Requests for url: ...v=ab407cdEfgh"], p), "")
+        self.assertEqual(pull.classify(["ReadTimeout: SOCKSHTTPSConnectionPool(host='www.youtube.com', port=443): "
+                                        "Read timed out."], p), "network")
+        self.assertEqual(pull.classify(["ConnectionError: SOCKSHTTPSConnectionPool(host='www.youtube.com'): Max "
+                                        "retries exceeded (ConnectionResetError: connection reset)"], p), "network")
+        self.assertEqual(pull.classify(["InvalidSchema: Missing dependencies for SOCKS support."], p), "proxy_setup")
+        self.assertIn("PySocks", pull.explain("proxy_setup", p, "x"))
+        self.assertEqual(pull.classify(["CONNECT tunnel failed, response 407"], p), "proxy_login")   # curl_cffi
+        self.assertEqual(pull.classify(["Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection "
+                                        "failed: 407 Proxy Authentication Required'))"], p), "proxy_login")
+
+    def test_an_export_order_line_with_a_raw_at_sign_is_refused_and_never_shown_as_a_host(self):
+        for url in ("http://gate.example.com:10001:myuser:Ab@cdEf12", "gate.example.com:10001:myuser:Ab@cdEf12",
+                    "http://localhost:3128:myuser:Ab@cdEf12"):
+            os.environ["PROXY_URL"] = url
+            with self.assertRaisesRegex(ValueError, "host:port:user:pass") as cm:
+                config.proxy_routes()
+            for secret in ("myuser", "Ab@cdEf12", "cdEf12", "cdef12"):
+                self.assertNotIn(secret, str(cm.exception))
+        os.environ["PROXY_URL"] = "myuser:12345:gate.example.com:10001"   # the other order: nothing echoed
+        with self.assertRaises(ValueError) as cm:
+            config.proxy_routes()
+        self.assertNotIn("myuser", str(cm.exception))
+        self.assertNotIn("12345", str(cm.exception))
+
+    def test_proxy_test_says_which_routes_are_cooling_down(self):
+        import server as server_mod
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        pull.cool_down("b.example:2")
+        real = pull._probe_send
+        self.addCleanup(setattr, pull, "_probe_send", real)
+        pull._probe_send = lambda proxy: 200
+        rows = server_mod.t_proxy_test({})["results"]
+        self.assertEqual([r.get("cooling_down", False) for r in rows], [False, True])
+
+    def test_a_cool_down_written_by_0_3_1_is_still_honoured(self):
+        (pull.jobs_dir() / "cooldown.json").write_text(json.dumps(
+            {"until": time.time() + 600, "routes": ["direct"]}), encoding="utf-8")
+        with self.assertRaisesRegex(pull.PullError, "this address"):
+            pull.check_cooldown(pull.build_job({"kind": "video", "target": VID_A}))
+        (pull.jobs_dir() / "cooldown.json").write_text(json.dumps(
+            {"until": time.time() - 1, "routes": ["direct"]}), encoding="utf-8")
+        self.assertEqual(pull.check_cooldown(pull.build_job({"kind": "video", "target": VID_A})), [])
+        (pull.jobs_dir() / "cooldown.json").write_text("not json", encoding="utf-8")
+        self.assertEqual(pull.cooling_routes(), {})
+
+    def test_with_no_proxy_one_refused_address_still_stops_the_pull_as_before(self):
+        class IpBlocked(Exception):
+            pass
+
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert", "details": False})
+        pull.write_job(job)
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = pull.run_job(job["id"], lister=PullTests.lister([f"{i:011d}" for i in range(20)]),
+                                fetcher=lambda *a: (_ for _ in ()).throw(IpBlocked()), detailer=None,
+                                sleep=lambda s: None)
+        self.assertEqual(done["state"], "blocked")
+        self.assertIn("set a proxy", done["message"])
+        self.assertEqual(done["counts"]["failed"], pull.BLOCK_STREAK)
+
+    # ---- issue 10: the pull rate in the settings -----------------------------------------
+
+    def test_the_settings_give_the_pull_defaults_and_the_limits_still_hold(self):
+        os.environ["PROXY_URL"] = "http://gate.example:10001"
+        os.environ["PROXY_PORT_COUNT"] = "10"
+        os.environ["EXPERTISE_MINER_WORKERS"] = "4"
+        os.environ["EXPERTISE_MINER_DELAY_MS"] = "3000"
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert"})
+        self.assertEqual((job["workers"], job["delay_ms"]), (4, 3000))
+        self.assertEqual(job["rate_from"], {"workers": "settings", "delay_ms": "settings"})
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert", "workers": 2, "delay_ms": 800})
+        self.assertEqual((job["workers"], job["delay_ms"]), (2, 800))               # a value on the pull wins
+        os.environ["EXPERTISE_MINER_WORKERS"] = "20"
+        os.environ["EXPERTISE_MINER_DELAY_MS"] = "100"
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert"})
+        self.assertEqual((job["workers"], job["delay_ms"]), (config.MAX_WORKERS, config.MIN_DELAY_MS))
+        del os.environ["PROXY_URL"], os.environ["PROXY_PORT_COUNT"]
+        self.assertEqual(pull.build_job({"kind": "channel", "target": "@SomeExpert"})["workers"], 1)  # no proxy
+        for bad in ("four", "0", "-2", "1.5"):
+            os.environ["EXPERTISE_MINER_WORKERS"] = bad
+            with self.assertRaises(ValueError, msg=bad):
+                pull.build_job({"kind": "channel", "target": "@SomeExpert"})
+
+    def test_resume_keeps_what_the_pull_was_given_and_otherwise_takes_the_settings(self):
+        import server as server_mod
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2,http://c.example:3"
+        started = []
+        real = pull.create_job
+        self.addCleanup(setattr, pull, "create_job", real)
+        pull.create_job = lambda spec: (started.append(spec), pull.build_job(spec))[1]
+        real_need = server_mod._need_pull_packages
+        self.addCleanup(setattr, server_mod, "_need_pull_packages", real_need)
+        server_mod._need_pull_packages = lambda: None
+        given = pull.build_job({"kind": "channel", "target": "@SomeExpert", "workers": 2})
+        plain = pull.build_job({"kind": "channel", "target": "@SomeExpert"})
+        for j in (given, plain):
+            j["state"] = "blocked"
+            pull.write_job(j)
+        os.environ["EXPERTISE_MINER_WORKERS"] = "3"
+        self.assertEqual(server_mod.t_pull_resume({"job_id": given["id"]})["workers"], 2)
+        self.assertEqual(server_mod.t_pull_resume({"job_id": plain["id"]})["workers"], 3)
+
+    # ---- issue 8: a listing cut short ----------------------------------------------------
+
+    def test_a_listing_that_stops_at_one_page_is_reported_in_the_job(self):
+        entries = [{"id": f"{i:011d}", "title": "t"} for i in range(100)]
+        self.fake_ydl(info={"entries": entries, "playlist_count": 175},
+                      warnings=["Your yt-dlp version (2026.03.17) is older than 90 days!"])
+        job = pull.build_job({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        pull.write_job(job)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            done = pull.run_job(job["id"], fetcher=lambda *a: {"segments": SEGS, "language": "en",
+                                                               "is_generated": True},
+                                detailer=None, sleep=lambda s: None)
+        self.assertEqual(done["state"], "done")
+        import server as server_mod
+        view = server_mod._job_view(pull.read_job(job["id"]))
+        self.assertTrue(any("100 of the 175" in w for w in view["warnings"]), view["warnings"])
+        self.assertTrue(any("older than 90 days" in w for w in view["warnings"]))
+        self.assertIn("100 of the 175", printed.getvalue())
+        self.assertEqual(pull.cut_short(100, None, None, 100)[:15], "listed exactly ")
+        self.assertEqual(pull.cut_short(70, 70, None, 100), "")
+        self.assertEqual(pull.cut_short(172, 175, None, 100), "")      # a few hidden videos are not a cut
+        self.assertEqual(pull.cut_short(70, 175, 70, 100), "")         # the cap asked for, reached
+        self.assertEqual(pull.cut_short(30, None, None, 30)[:15], "listed exactly ")
+
+    # ---- issue 2: proxy_test -------------------------------------------------------------
+
+    def test_proxy_test_reports_each_route_as_host_and_port_only(self):
+        os.environ["PROXY_URLS"] = ("http://u:goodpw11@a.example:1,http://u:wrongpw22@b.example:2,"
+                                    "http://u:pw33333@c.example:3,http://u:pw44444@d.example:4")
+
+        class ProxyError(Exception):
+            pass
+
+        class ConnectTimeout(Exception):
+            pass
+
+        def send(proxy):
+            if "a.example" in proxy:
+                return 200
+            if "b.example" in proxy:
+                raise ProxyError("Tunnel connection failed: 407 Proxy Authentication Required "
+                                 "for http://u:wrongpw22@b.example:2")
+            if "c.example" in proxy:
+                raise ProxyError("Cannot connect to proxy: [Errno 111] Connection refused")
+            raise ConnectTimeout("timed out")
+
+        rows = pull.probe_routes(config.proxy_routes(), send=send)
+        self.assertEqual([(r["route"], r["result"]) for r in rows],
+                         [("a.example:1", "ok"), ("b.example:2", "login refused (407)"),
+                          ("c.example:3", "unreachable"), ("d.example:4", "timeout")])
+        text = json.dumps(rows)
+        for secret in ("goodpw11", "wrongpw22", "pw33333", "pw44444", "u:"):
+            self.assertNotIn(secret, text)
+
+    def test_proxy_test_with_no_proxy_sends_nothing_and_setup_check_still_contacts_nothing(self):
+        import server as server_mod
+        sent = []
+        real = pull._probe_send
+        self.addCleanup(setattr, pull, "_probe_send", real)
+        pull._probe_send = lambda proxy: sent.append(proxy) or 200
+        got = server_mod.t_proxy_test({})
+        self.assertEqual((got["tested"], sent), (0, []))
+        os.environ["PROXY_URL"] = "http://gate.example:10001"
+        os.environ["PROXY_PORT_COUNT"] = "3"
+        server_mod.t_setup_check({})
+        self.assertEqual(sent, [])                                       # setup_check stays read-only
+        self.assertIn("proxy_test", server_mod.t_setup_check({}))
+
+    # ---- issues 6, 7, 10, 11: what setup_check says ---------------------------------------
+
+    def test_setup_check_explains_workers_and_shows_the_pull_defaults(self):
+        import server as server_mod
+        os.environ["PROXY_URL"] = "http://gate.example:10001"
+        os.environ["PROXY_PORT_COUNT"] = "10"
+        os.environ["EXPERTISE_MINER_WORKERS"] = "4"
+        got = server_mod.t_setup_check({})
+        self.assertEqual(got["max_workers"], 8)
+        self.assertIn("stand by", got["max_workers_note"])
+        self.assertEqual(got["pull_defaults"]["workers"], 4)
+        self.assertEqual(got["pull_defaults"]["delay_ms"], config.DEFAULT_DELAY_MS)
+        self.assertEqual(got["pull_defaults"]["from"]["workers"], "EXPERTISE_MINER_WORKERS")
+        os.environ["EXPERTISE_MINER_DELAY_MS"] = "slow"
+        got = server_mod.t_setup_check({})
+        self.assertTrue(any(p.startswith("pull defaults") for p in got["problems"]))
+        self.assertFalse(got["can_pull"])
+
+    def test_an_old_yt_dlp_and_a_missing_javascript_runtime_are_reported(self):
+        import datetime as dt
+        import shutil
+        import server as server_mod
+        problems, warnings = [], []
+        rep = server_mod._ytdlp_report("2026.3.17", problems, warnings, today=dt.date(2026, 11, 12))
+        self.assertEqual(rep["age_days"], 240)
+        self.assertIn("-U", rep["upgrade_command"])
+        self.assertTrue(any("240 days old" in p for p in problems))
+        problems, warnings = [], []
+        rep = server_mod._ytdlp_report("2026.9.1", problems, warnings, today=dt.date(2026, 11, 12))
+        self.assertEqual((rep["age_days"], problems), (72, []))
+        self.assertTrue(any("72 days old" in w for w in warnings))
+        problems, warnings = [], []
+        rep = server_mod._ytdlp_report("2026.10.26", problems, warnings, today=dt.date(2026, 11, 12))
+        self.assertNotIn("upgrade_command", rep)
+        self.assertEqual(problems, [])
+        self.assertEqual(any("deno" in w for w in warnings), shutil.which("deno") is None)
+
+    def test_a_missing_numpy_is_said_before_search_by_meaning_needs_it(self):
+        import server as server_mod
+        real = store_mod._numpy
+        self.addCleanup(setattr, store_mod, "_numpy", real)
+        store_mod._numpy = lambda: None
+        os.environ.update({"EXPERTISE_MINER_EMBED_URL": "https://embed.example/v1", "EXPERTISE_MINER_EMBED_MODEL": "m"})
+        got = server_mod.t_setup_check({})
+        self.assertEqual(got["embeddings"]["stored"]["vectors"], 0)
+        self.assertTrue(any("numpy" in w for w in got["warnings"]), got["warnings"])
+        self.assertIn("numpy", got["embeddings"]["install_command"])
+        st = server_mod.get_store()
+        st.upsert_video(self.video())
+        st.count_pending = lambda model: {"passages": 5000, "characters": 2_000_000, "refused": 0}
+        status = server_mod.t_embed_status({})
+        self.assertIn("numpy", status["numpy_notice"])
+        self.assertIn("numpy", status["numpy_install_command"])
+        st.count_pending = lambda model: {"passages": 10, "characters": 4000, "refused": 0}
+        self.assertNotIn("numpy_notice", server_mod.t_embed_status({}))
+        store_mod._numpy = real
+        if real() is not None:
+            st.count_pending = lambda model: {"passages": 5000, "characters": 2_000_000, "refused": 0}
+            self.assertNotIn("numpy_notice", server_mod.t_embed_status({}))
 
 
 class MineTests(Base):
@@ -1613,8 +2127,11 @@ class OnboardTests(Base):
             got = onboard.write(dict(answers))
             self.assertEqual(Path(got["written"]), env)
             text = env.read_text(encoding="utf-8")
-            for name in self.ALL_NAMES:                                    # every setting is in the file
-                self.assertRegex(text, rf"(?m)^(# )?{name}(=| )", (answers, name))
+            for name in config._KEYS:                                      # every setting is in the file
+                self.assertRegex(text, rf"(?m)^(# )?{name}=", (answers, name))
+            for name in ("EXPERTISE_MINER_HOME", "EXPERTISE_MINER_PYTHON"):  # named, but never as a line to fill in
+                self.assertIn(name, text, (answers, name))
+                self.assertNotRegex(text, rf"(?m)^#\s*{name}\b", (answers, name))
             cfg = config.storage_config()
             self.assertEqual((cfg["kind"], Path(cfg["path"])), ("sqlite", self.home / "corpus.db"), answers)
             self.assertIsNone(config.embed_config(), answers)             # nothing would be sent anywhere
@@ -1832,7 +2349,7 @@ class ServerTests(Base):
         self.assertEqual(names, {"setup_check", "pull_channel", "pull_playlist", "pull_video", "pull_status",
                                  "pull_resume", "pull_stop", "search_transcripts", "get_transcript",
                                  "list_corpus", "mine_prepare", "mine_verify", "mine_build",
-                                 "embed_status", "embed_start", "embed_stop", "setup_write"})
+                                 "embed_status", "embed_start", "embed_stop", "setup_write", "proxy_test"})
         self.assertEqual(self.body(out[2])["channels"][0]["videos"], 1)
         hit = self.body(out[3])["results"][0]
         self.assertEqual((hit["video_id"], hit["passages"][0]["at"]), (VID_A, "00:00"))

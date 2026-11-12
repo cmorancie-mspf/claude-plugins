@@ -5,7 +5,7 @@ description: Build or extend a corpus of YouTube transcripts with the expertise-
 
 # Pull transcripts into the corpus
 
-The tools are on the `expertise-miner` MCP server: `setup_check`, `pull_channel`, `pull_playlist`, `pull_video`, `pull_status`, `pull_resume`, `pull_stop`, `list_corpus`.
+The tools are on the `expertise-miner` MCP server: `setup_check`, `pull_channel`, `pull_playlist`, `pull_video`, `pull_status`, `pull_resume`, `pull_stop`, `list_corpus`, and `proxy_test` (optional, only when the user agrees).
 
 If those tools are not available in this session, the server did not start. It needs Node and a Python of version 3.9 or later; when Python is somewhere unusual, the user sets `EXPERTISE_MINER_PYTHON` to its full path in their environment and starts a new session. Say that and stop; do not try to run the server's files by hand.
 
@@ -45,9 +45,11 @@ One pull runs at a time per data folder. A second is refused while the first is 
 
 The defaults are slow on purpose: one worker and 1.5 seconds between videos. Each video is a transcript fetch and a read of its page for the date and view count, and each of those is several HTTP requests.
 
-- Do not lower `delay_ms` or raise `workers` unless the user asks, and say what it does when they do. The tools enforce a floor on the delay and never run more workers than there are distinct proxy routes, because two workers on one address only double what that address sends.
+- Do not lower `delay_ms` or raise `workers` unless the user asks, and say what it does when they do. The user may have set their own defaults in the settings (`EXPERTISE_MINER_WORKERS`, `EXPERTISE_MINER_DELAY_MS`; `setup_check` shows them as `pull_defaults`): leave both out of a pull to use them. The tools enforce a floor on the delay and never run more workers than there are distinct proxy routes, because two workers on one address only double what that address sends.
 - `details: false` skips the date and view count and makes a pull lighter. Offer it for a very large pull where dates do not matter. `min_views` needs the details.
-- A pull stops itself as **blocked** when five videos in a row, on one route, get neither a transcript nor a definite "none". That is the site saying stop. **Do not resume in a loop and do not retry at once.** The tools refuse a new pull over that pull's routes for 30 minutes; that is a floor, not a recommendation. Tell the user: wait some hours, or set a proxy in their `.env`, then `pull_resume`. Nothing stored is lost.
+- When five videos in a row, on one route, get neither a transcript nor a definite "none", that route is taken out for the rest of the pull and a standby route takes over if one is left; `routes_out` in `pull_status` lists them. The pull ends **blocked** only when every route is out. That is the site saying stop. **Do not resume in a loop and do not retry at once.** A route the site refused is held back from new pulls for 30 minutes (only that route; a new pull uses the others and says which it held back); that is a floor, not a recommendation. Read the message to the user: without a proxy it says wait some hours or set one; with proxies it names the routes and says to wait for the provider to rotate them. Then `pull_resume`. Nothing stored is lost.
+- If the message says the proxy **refused the login** or **could not be reached**, the site did nothing: the user checks `PROXY_URL` or `PROXY_URLS` in their settings file. `proxy_test` checks each route; ask before running it.
+- Read `warnings` in `pull_status` when a pull ends. A listing that may have been cut short (an out-of-date yt-dlp stops at the first page and says nothing) is reported there: tell the user, and point at `setup_check`'s `yt_dlp.upgrade_command`.
 - A proxy is the user's choice and the user's account. Mention that it exists; do not push it.
 
 ## 5. Resume, stop, check coverage
@@ -62,6 +64,7 @@ The defaults are slow on purpose: one worker and 1.5 seconds between videos. Eac
 | `TranscriptsDisabled`, `NoTranscriptFound` | The video has no captions, or none in the languages asked for | No, unless other languages are added (`retry_missing`) |
 | `VideoUnavailable`, `VideoUnplayable`, `AgeRestricted` | Private, removed, restricted | No |
 | `RequestBlocked`, `IpBlocked` | The site refused this address | Later, or through a proxy |
+| `ProxyLoginRefused`, `ProxyUnreachable` | The proxy refused the user name or password, or could not be reached. The site was not asked | After the user fixes the proxy in their settings |
 | `ViewCountUnavailable` | `min_views` was set and the video's page could not be read | Yes, with `pull_resume` |
 | Anything else | A network or parsing error | Yes, with `pull_resume` |
 
