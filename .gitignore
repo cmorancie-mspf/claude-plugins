@@ -6,4 +6,8 @@ Thumbs.db
 # a project's own plan folder, at the root only: a plugin has a skill folder of the same name
 /factory-plan/
 __pycache__/
+# settings with credentials never belong here; a plugin ships a .env.example with names only
+.env
+.env.*
+!.env.example
 *.pyc

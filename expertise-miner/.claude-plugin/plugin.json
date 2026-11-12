@@ -1,0 +1,18 @@
+{
+  "name": "expertise-miner",
+  "description": "Build a searchable corpus of YouTube transcripts for a channel, a playlist or a video, then mine it for an expert's research questions, rules of thumb and research steps. Every mined item carries a quote that was checked word for word against the stored transcript, the video and the moment it was said, and a way to test it against data. Slow and polite by default; local SQLite storage, MongoDB optional.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Chris Morancie"
+  },
+  "license": "MIT",
+  "keywords": [
+    "youtube",
+    "transcripts",
+    "research",
+    "expertise",
+    "knowledge-extraction",
+    "corpus"
+  ],
+  "repository": "https://github.com/production-ai-eng/claude-plugins"
+}

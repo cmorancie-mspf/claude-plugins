@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "expertise-miner": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/launch.mjs"]
+    }
+  }
+}
