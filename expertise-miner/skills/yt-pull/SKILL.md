@@ -11,9 +11,10 @@ If those tools are not available in this session, the server did not start. It n
 
 ## 1. First use on a machine
 
-Call `setup_check`. It contacts nothing. It reports the Python in use, the packages, where the corpus is stored, and how many routes requests can take.
+Call `setup_check`. It contacts nothing, except the user's own MongoDB server when that is the store. It reports the Python in use, the packages, where the corpus is stored, and how many routes requests can take.
 
 - If `can_pull` is false because packages are missing, tell the user what `install_command` would install and into which Python, and run it only when they agree. Run it exactly as printed; in PowerShell run `install_command_powershell`, because a command that starts with a quoted path, as this one does, needs `&` in front there. If pip refuses because the Python is managed by the system, do not force it: offer a virtual environment, and `EXPERTISE_MINER_PYTHON` pointing at its Python.
+- If `setup_check` says there is no settings file (`first_time`), what is in effect is in `choices`: the defaults, unless the environment sets something. Pulling works either way. Mention once that `/yt-setup` exists for choosing a database, search by meaning or a proxy; do not run it unasked.
 - Settings live in the user's environment or in the `.env` file whose path `setup_check` prints. A list of the names is in `${CLAUDE_PLUGIN_ROOT}/.env.example`. **Never ask for, print or write a password, a connection string or a proxy address yourself.** The user edits that file.
 
 ## 2. Decide what to pull, with the user

@@ -80,6 +80,7 @@ For finding out how an expert actually works, from what they have said on YouTub
 
 | Type | What happens |
 |---|---|
+| `/yt-setup` | Optional: asks which database, which search and whether to use a proxy, and writes your settings file with placeholders where secrets go |
 | `/yt-pull @SomeChannel` | Pulls the channel's transcripts in the background, skipping what is already stored |
 | `/yt-search "some phrase"` | Finds the passages where it was said, ranked, with quotes and links to the moment |
 | `/mine-expertise @SomeChannel` | One reader per video writes items; a tool rejects every item whose quote is not in the transcript; the rest are clustered into a question bank |

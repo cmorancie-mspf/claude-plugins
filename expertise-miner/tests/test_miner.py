@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "server"))
 import config  # noqa: E402
 import embed  # noqa: E402
 import mine  # noqa: E402
+import onboard  # noqa: E402
 import pull  # noqa: E402
 import store as store_mod  # noqa: E402
 
@@ -1592,6 +1593,214 @@ class HybridSearchTests(EmbedBase):
         self.assertTrue(any("model-a" in p for p in self.server.t_setup_check({})["problems"]))
 
 
+class OnboardTests(Base):
+    ALL_NAMES = list(config._KEYS) + ["EXPERTISE_MINER_HOME", "EXPERTISE_MINER_PYTHON"]
+
+    def every_answer(self):
+        for store in onboard.STORES:
+            for proxy in onboard.PROXIES:
+                yield {"store": store, "search": "words", "proxy": proxy}
+                if store == "sqlite":
+                    for endpoint in onboard.ENDPOINTS:
+                        yield {"store": store, "search": "meaning", "endpoint": endpoint, "proxy": proxy}
+
+    def test_whatever_is_answered_the_file_as_written_switches_nothing_on(self):
+        n = 0
+        for answers in self.every_answer():
+            n += 1
+            env = self.home / ".env"
+            env.unlink(missing_ok=True)
+            got = onboard.write(dict(answers))
+            self.assertEqual(Path(got["written"]), env)
+            text = env.read_text(encoding="utf-8")
+            for name in self.ALL_NAMES:                                    # every setting is in the file
+                self.assertRegex(text, rf"(?m)^(# )?{name}(=| )", (answers, name))
+            cfg = config.storage_config()
+            self.assertEqual((cfg["kind"], Path(cfg["path"])), ("sqlite", self.home / "corpus.db"), answers)
+            self.assertIsNone(config.embed_config(), answers)             # nothing would be sent anywhere
+            self.assertEqual(config.proxy_routes(), [None], answers)
+            self.assertEqual(config.search_config(), {"stemming": True, "match": "ranked"}, answers)
+            on = [l for l in text.splitlines() if l and not l.startswith("#")]
+            self.assertEqual(on, ["EXPERTISE_MINER_STORE=sqlite", "EXPERTISE_MINER_SEARCH_STEMMING=on",
+                                  "EXPERTISE_MINER_SEARCH_MATCH=ranked"], answers)
+            wants = (answers["store"] == "mongo") + (answers["search"] == "meaning") + (answers["proxy"] != "none")
+            self.assertEqual(len(got["left_for_the_person"]), wants, answers)
+        self.assertEqual(n, 18)
+
+    def test_the_file_becomes_the_chosen_setup_once_the_person_fills_it_in(self):
+        onboard.write({"search": "meaning", "endpoint": "cloudflare", "proxy": "one"})
+        env = self.home / ".env"
+        text = env.read_text(encoding="utf-8")
+        for line in ("# EXPERTISE_MINER_EMBED_URL=", "# EXPERTISE_MINER_EMBED_MODEL=", "# EXPERTISE_MINER_EMBED_KEY=",
+                     "# PROXY_URL="):
+            self.assertEqual(text.count(line), 1, line)
+            text = text.replace(line, line[2:])                           # what the person does: remove the "# "
+        text = text.replace("ACCOUNT_ID", "abc123").replace("=TOKEN", "=tok-xyz").replace("=MODEL_NAME", "=@cf/baai/bge-m3").replace(
+            "http://USER:PASSWORD@HOST:PORT", "http://u:pw@gate.example:7000")
+        env.write_text(text, encoding="utf-8")
+        e = config.embed_config()
+        self.assertEqual((e["host"], e["model"], e["key"]), ("api.cloudflare.com", "@cf/baai/bge-m3", "tok-xyz"))
+        self.assertTrue(e["url"].endswith("/accounts/abc123/ai/v1/embeddings"))
+        self.assertEqual(config.proxy_routes(), ["http://u:pw@gate.example:7000"])
+        env.unlink()
+        onboard.write({"store": "mongo"})
+        text = env.read_text(encoding="utf-8").replace("EXPERTISE_MINER_STORE=sqlite", "# EXPERTISE_MINER_STORE=sqlite", 1)
+        for name in ("EXPERTISE_MINER_STORE=mongo", "MONGO_HOST=HOST", "MONGO_PORT=", "MONGO_USER=", "MONGO_PASS=",
+                     "MONGO_AUTH_SOURCE=", "MONGO_DB=", "MONGO_COLLECTION="):
+            self.assertEqual(text.count("# " + name), 1, name)
+            text = text.replace("# " + name, name)
+        env.write_text(text.replace("=HOST", "=db.example").replace("=USER", "=me").replace("=PASSWORD", "=pw12345"),
+                       encoding="utf-8")
+        cfg = config.storage_config()
+        self.assertEqual((cfg["kind"], cfg["host"], cfg["db"], cfg["collection"]),
+                         ("mongo", "db.example", "expertise_miner", "videos"))
+        env.unlink()
+        onboard.write({"search": "meaning", "endpoint": "local"})
+        text = env.read_text(encoding="utf-8")
+        self.assertIn("not the _KEY line", onboard.render(onboard.read_choices(
+            {"search": "meaning", "endpoint": "local"}))[1][0])            # a local server is not told to set a key
+        text = text.replace("# EXPERTISE_MINER_EMBED_URL=", "EXPERTISE_MINER_EMBED_URL=").replace(
+            "# EXPERTISE_MINER_EMBED_MODEL=MODEL_NAME", "EXPERTISE_MINER_EMBED_MODEL=some-model")
+        env.write_text(text, encoding="utf-8")
+        self.assertEqual((config.embed_config()["local"], config.embed_config()["key"]), (True, ""))
+
+    def test_an_existing_settings_file_is_never_touched(self):
+        env = self.home / ".env"
+        env.write_text("MONGO_PASS=hunter2hunter2\n", encoding="utf-8")
+        with self.assertRaises(onboard.OnboardError) as cm:
+            onboard.write({"proxy": "one"})
+        self.assertNotIn("hunter2", str(cm.exception))
+        self.assertEqual(env.read_text(encoding="utf-8"), "MONGO_PASS=hunter2hunter2\n")
+
+    def test_only_choices_from_the_lists_are_taken_never_an_address_or_a_key(self):
+        bad = [{"embed_url": "https://evil.example/v1"}, {"url": "https://evil.example/v1"}, {"key": "sk-123"},
+               {"proxy": "http://u:p@evil.example:1"}, {"proxy_url": "http://u:p@evil.example:1"},
+               {"store": "postgres"}, {"store": "sqlite\nPROXY_URL=http://evil.example:1"}, {"store": ["mongo"]},
+               {"search": "meaning"}, {"search": "meaning", "endpoint": "https://evil.example/v1"},
+               {"search": "meaning", "endpoint": "local", "store": "mongo"}, {"match": "all"}, {"stemming": False},
+               {"proxy": "one\nEXPERTISE_MINER_EMBED_URL=https://evil.example/v1"},
+               {"mongo_host": "db.example"}, {"endpoint": 5}]
+        for a in bad:
+            with self.assertRaises(onboard.OnboardError, msg=a):
+                onboard.write(a)
+            self.assertFalse((self.home / ".env").exists(), a)
+        for endpoint, spec in onboard.ENDPOINTS.items():                   # the fixed addresses are themselves valid
+            s = {k: "" for k in config._KEYS}
+            s.update(EXPERTISE_MINER_EMBED_URL=spec["url"].replace("ACCOUNT_ID", "a1").replace("HOST", "h.example"),
+                     EXPERTISE_MINER_EMBED_MODEL="m")
+            self.assertIsNotNone(config.embed_config(s), endpoint)
+        text = "".join(onboard.render(onboard.read_choices(a))[0] for a in self.every_answer())
+        self.assertNotIn("evil", text)
+
+    def test_a_placeholder_left_in_and_switched_on_is_refused_not_used(self):
+        env = self.home / ".env"
+        for endpoint in onboard.ENDPOINTS:
+            env.unlink(missing_ok=True)
+            onboard.write({"search": "meaning", "endpoint": endpoint})
+            text = env.read_text(encoding="utf-8")
+            for name in ("URL", "MODEL", "KEY"):                              # switched on, nothing replaced
+                text = text.replace(f"# EXPERTISE_MINER_EMBED_{name}=", f"EXPERTISE_MINER_EMBED_{name}=")
+            env.write_text(text, encoding="utf-8")
+            with self.assertRaises(ValueError, msg=endpoint) as cm:
+                config.embed_config()
+            self.assertIn("placeholder", str(cm.exception))
+            with self.assertRaises(pull.PullError, msg=endpoint):
+                embed.build_job({})                                           # so no run starts and nothing is sent
+        s = {k: "" for k in config._KEYS}
+        ok = dict(s, EXPERTISE_MINER_EMBED_URL="https://api.example/v1", EXPERTISE_MINER_EMBED_MODEL="m")
+        for name, value in (("EXPERTISE_MINER_EMBED_URL", "https://api.example/accounts/ACCOUNT_ID/v1"),
+                            ("EXPERTISE_MINER_EMBED_URL", "https://HOST/v1"), ("EXPERTISE_MINER_EMBED_URL", "https://HOST:8443/v1"),
+                            ("EXPERTISE_MINER_EMBED_MODEL", "MODEL_NAME"), ("EXPERTISE_MINER_EMBED_KEY", "TOKEN"),
+                            ("EXPERTISE_MINER_EMBED_KEY", "API_KEY"), ("EXPERTISE_MINER_EMBED_KEY", "KEY")):
+            with self.assertRaises(ValueError, msg=value):
+                config.embed_config(dict(ok, **{name: value}))
+        self.assertEqual(config.embed_config(dict(ok, EXPERTISE_MINER_EMBED_URL="https://hostess.example/v1"))["host"],
+                         "hostess.example")                                   # a real name that only looks alike
+        mongo = dict(s, EXPERTISE_MINER_STORE="mongo", MONGO_HOST="db.example", MONGO_USER="u", MONGO_PASS="p")
+        self.assertEqual(config.storage_config(mongo)["kind"], "mongo")
+        for name, value in (("MONGO_HOST", "HOST"), ("MONGO_USER", "USER"), ("MONGO_PASS", "PASSWORD")):
+            with self.assertRaises(ValueError, msg=value):
+                config.storage_config(dict(mongo, **{name: value}))
+        env.unlink()
+        onboard.write({"proxy": "one"})
+        env.write_text(env.read_text(encoding="utf-8").replace("# PROXY_URL=", "PROXY_URL="), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            config.proxy_routes()
+        import server as server_mod
+        self.addCleanup(lambda: (server_mod._store and server_mod._store.close(), setattr(server_mod, "_store", None)))
+        got = server_mod.t_setup_check({})
+        self.assertFalse(got["can_pull"])
+        self.assertTrue(any(p.startswith("proxy") for p in got["problems"]))
+
+    def test_anything_already_at_that_path_is_left_alone(self):
+        env = self.home / ".env"
+        env.mkdir()                                                           # a folder of that name
+        with self.assertRaises(onboard.OnboardError):
+            onboard.write({})
+        import server as server_mod
+        self.addCleanup(lambda: (server_mod._store and server_mod._store.close(), setattr(server_mod, "_store", None)))
+        self.assertNotIn("first_time", server_mod.t_setup_check({}))
+        env.rmdir()
+        target = self.home / "elsewhere.txt"
+        try:
+            env.symlink_to(target)                                            # a link to nothing
+        except (OSError, NotImplementedError):
+            self.skipTest("this account cannot make links")
+        with self.assertRaises(onboard.OnboardError):
+            onboard.write({})
+        self.assertFalse(target.exists())
+
+    def test_a_change_of_database_is_what_the_next_call_uses_and_reports(self):
+        import server as server_mod
+        self.addCleanup(lambda: (server_mod._store and server_mod._store.close(), setattr(server_mod, "_store", None)))
+        server_mod._store = None
+        first = server_mod.get_store()
+        first.upsert_video(self.video())
+        self.assertEqual(server_mod.t_setup_check({})["corpus"]["videos"], 1)
+        self.assertIs(server_mod.get_store(), first)                          # unchanged settings: the same open store
+        os.environ["EXPERTISE_MINER_DB"] = str(self.home / "other.db")
+        got = server_mod.t_setup_check({})
+        self.assertIn("other.db", got["storage"])
+        self.assertEqual(got["corpus"]["videos"], 0)                          # the count is of the file it names
+        self.assertEqual(server_mod.t_list_corpus({})["videos"], 0)
+        os.environ["EXPERTISE_MINER_SEARCH_STEMMING"] = "off"
+        self.assertFalse(server_mod.get_store().stemming)
+        del os.environ["EXPERTISE_MINER_DB"], os.environ["EXPERTISE_MINER_SEARCH_STEMMING"]
+        self.assertEqual(server_mod.t_list_corpus({})["videos"], 1)           # and back again
+
+    def test_the_shipped_example_is_the_file_for_the_default_answers(self):
+        shipped = (ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertEqual(shipped, onboard.example_text())
+        onboard.write({})
+        self.assertEqual((self.home / ".env").read_text(encoding="utf-8"), shipped)
+
+    def test_setup_check_says_what_is_chosen_and_points_a_first_timer_at_the_questions(self):
+        import server as server_mod
+        self.addCleanup(lambda: (server_mod._store and server_mod._store.close(), setattr(server_mod, "_store", None)))
+        got = server_mod.t_setup_check({})
+        self.assertEqual(got["choices"], {"database": "SQLite", "search": "by words", "proxy": "none"})
+        self.assertIn("setup_write", got["first_time"])
+        os.environ["PROXY_URL"] = "http://gate.example:1"                     # no file, but not the defaults either
+        got = server_mod.t_setup_check({})
+        self.assertEqual(got["choices"]["proxy"], "1 route(s)")
+        self.assertIn("unless the environment sets something", got["first_time"])
+        del os.environ["PROXY_URL"]
+        out = server_mod.t_setup_write({"proxy": "one"})
+        self.assertEqual(len(out["left_for_the_person"]), 1)
+        self.assertNotIn("first_time", server_mod.t_setup_check({}))
+        os.environ.update({"PROXY_URLS": "http://u:secretpw@a.example:1,http://b.example:2",
+                           "EXPERTISE_MINER_EMBED_URL": "https://embed.example/v1/acct999x",
+                           "EXPERTISE_MINER_EMBED_MODEL": "model-a", "EXPERTISE_MINER_EMBED_KEY": "sk-SECRETKEY99"})
+        got = server_mod.t_setup_check({})
+        self.assertEqual(got["choices"], {"database": "SQLite", "search": "by words, and by meaning (model-a at embed.example)",
+                                          "proxy": "2 route(s)"})
+        for secret in ("secretpw", "sk-SECRETKEY99", "acct999x"):
+            self.assertNotIn(secret, json.dumps(got))
+        del os.environ["EXPERTISE_MINER_EMBED_MODEL"]
+        self.assertIn("incomplete", server_mod.t_setup_check({})["choices"]["search"])
+
+
+
 class ServerTests(Base):
     def rpc(self, *calls):
         self.open().upsert_video(self.video())
@@ -1623,7 +1832,7 @@ class ServerTests(Base):
         self.assertEqual(names, {"setup_check", "pull_channel", "pull_playlist", "pull_video", "pull_status",
                                  "pull_resume", "pull_stop", "search_transcripts", "get_transcript",
                                  "list_corpus", "mine_prepare", "mine_verify", "mine_build",
-                                 "embed_status", "embed_start", "embed_stop"})
+                                 "embed_status", "embed_start", "embed_stop", "setup_write"})
         self.assertEqual(self.body(out[2])["channels"][0]["videos"], 1)
         hit = self.body(out[3])["results"][0]
         self.assertEqual((hit["video_id"], hit["passages"][0]["at"]), (VID_A, "00:00"))
@@ -1635,6 +1844,16 @@ class ServerTests(Base):
         for i in (6, 7, 8):
             self.assertTrue(out[i]["result"]["isError"], i)
         self.assertEqual(out[9]["error"]["code"], -32601)
+
+    def test_set_up_through_the_protocol_takes_choices_only(self):
+        out = self.rpc(("tools/call", {"name": "setup_write", "arguments": {"proxy": "one", "url": "https://evil.example"}}),
+                       ("tools/call", {"name": "setup_write", "arguments": {"search": "meaning", "endpoint": "openai"}}),
+                       ("tools/call", {"name": "setup_write", "arguments": {}}),
+                       ("tools/call", {"name": "search_transcripts", "arguments": {"query": "role change"}}))
+        self.assertTrue(out[1]["result"]["isError"])
+        self.assertIn("EXPERTISE_MINER_EMBED_", self.body(out[2])["left_for_the_person"][0])
+        self.assertTrue(out[3]["result"]["isError"])                        # a second write is refused
+        self.assertEqual(self.body(out[4])["by_meaning"], {"used": False, "why_not": "no embeddings endpoint is set"})
 
     def test_several_wordings_are_searched_and_merged(self):
         st = self.open()
