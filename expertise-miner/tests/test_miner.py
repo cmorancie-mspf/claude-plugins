@@ -1233,7 +1233,8 @@ class Phase2Tests(Base):
 
     def playlist_by_route(self, by_route, errors=()):
         """yt-dlp replaced: the listing over a route whose name holds a key of by_route returns
-        (entries, playlist_count) for it. Records the routes listed over in self.listed_over."""
+        (entries, playlist_count) for it, or (entries, playlist_count, first id number); for a
+        channel, a dict of those by tab. Records the routes listed over in self.listed_over."""
         test = self
         self.listed_over = []
 
@@ -1251,9 +1252,16 @@ class Phase2Tests(Base):
                 test.listed_over.append(config.mask_proxy(self.proxy))
                 for e in errors:
                     self.logger.error(e)
-                n, count = next(v for k, v in by_route.items() if k in (self.proxy or "direct"))
+                got = next(v for k, v in by_route.items() if k in (self.proxy or "direct"))
+                tab = url.rsplit("/", 1)[-1]
+                if isinstance(got, dict):
+                    got, prefix = got[tab], tab[:2]
+                else:
+                    prefix = ""
+                n, count, start = (tuple(got) + (0,))[:3]
                 end = self.extra.get("playlistend")
-                return {"entries": [{"id": f"{i:011d}", "title": "t"} for i in range(min(n, end or n))],
+                return {"entries": [{"id": f"{prefix}{i:0{11 - len(prefix)}d}", "title": "t"}
+                                    for i in range(start, start + min(n, end or n))],
                         "playlist_count": count}
 
         real = pull._ydl
@@ -1549,6 +1557,44 @@ class Phase2Tests(Base):
         done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
         self.assertEqual((done["state"], done["counts"]["listed"]), ("partial", 120))
         self.assertIn("listed 120 of 174", done["message"])
+
+    # ---- fixes from the second review: a second listing judged tab by tab ------------------------
+
+    def test_each_tab_is_judged_on_its_own_count_after_listing_again(self):
+        # second review A: a short tab is not hidden by a whole one in the channel's total
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        self.playlist_by_route({"a.example": {"videos": (600, 600), "shorts": (160, 200)},
+                                "b.example": {"videos": (600, 600), "shorts": (165, 200)}})
+        done, printed = self.pull_with({"kind": "channel", "target": "@SomeExpert", "include": ["videos", "shorts"],
+                                        "max_videos": 0, "details": False, "workers": 2})
+        self.assertEqual(self.listed_over, ["a.example:1"] * 2 + ["b.example:2"] * 2)
+        self.assertEqual(done["state"], "partial")                  # 765 of 800 is within 5% of the whole channel,
+        self.assertEqual((done["counts"]["listed"], done["counts"]["site_count"]), (765, 800))
+        self.assertIn("shorts: listed 165 of 200", done["message"])  # but shorts is 35 short of its own 200
+        self.assertNotIn("taken as whole", printed)
+        self.assertTrue(any(w.startswith("shorts:") for w in done["warnings"]), done["warnings"])
+
+    def test_a_tab_with_no_count_does_not_stop_the_listing_from_being_whole(self):
+        # second review B
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        self.playlist_by_route({"a.example": {"videos": (12, None), "shorts": (99, 174)},
+                                "b.example": {"videos": (12, None), "shorts": (174, 174)}})
+        done, printed = self.pull_with({"kind": "channel", "target": "@SomeExpert", "include": ["videos", "shorts"],
+                                        "max_videos": 0, "details": False})
+        self.assertEqual(done["state"], "done")
+        self.assertEqual((done["counts"]["listed"], done["counts"]["site_count"]), (186, None))
+        self.assertIn("taken as whole", printed)
+
+    def test_when_the_listing_is_taken_as_whole_neither_listings_warnings_are_kept(self):
+        # second review C: each listing alone is short; together they hold all 174
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        self.playlist_by_route({"a.example": (99, 174, 0), "b.example": (100, 174, 74)})
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        self.assertEqual((done["state"], done["counts"]["listed"]), ("done", 174))
+        self.assertFalse(any("may have been cut short" in w for w in done["warnings"]), done["warnings"])
+        self.assertTrue(any("listed again over b.example:2: 174 in all" in w for w in done["warnings"]),
+                        done["warnings"])
+        self.assertNotIn("tabs", pull.read_job(done["id"]).get("listing", {}))   # no entry ids in the record
 
     def test_each_channel_tab_listed_takes_its_own_turn(self):
         # review item 2

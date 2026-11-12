@@ -606,9 +606,11 @@ def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) 
     Also sets job['listing']: site_count (the total the site gave, summed over the tabs when
     every tab gave one, else None), short (a playlist or tab came back short of the site's own
     count, by cut_short's measure: more than 5 entries and 5% short, or short and ending on a
-    whole page), short_notes (the warnings that
-    said so), short_detail (what was short, for the end message) and errors (yt-dlp's own
-    error lines during the listing, with credentials filtered out)."""
+    whole page), short_notes (the warnings that said so), short_detail (what was short, for the
+    end message), tabs ({tab name or 'the playlist': {count, ids, short}}: each tab's own count,
+    the ids of the entries it returned, and whether it was short, so that a second listing can be
+    judged tab by tab) and errors (yt-dlp's own error lines during the listing, with credentials
+    filtered out)."""
     cap = job["max_videos"]
     end = cap + 20 if cap else None          # a little past the cap, for entries that are not videos
     flat = {"extract_flat": "in_playlist"}
@@ -616,7 +618,8 @@ def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) 
         flat["playlistend"] = end
     out: list = []
     log = _Quiet()
-    listing: dict = {"site_count": None, "short": False, "short_notes": [], "short_detail": [], "errors": []}
+    listing: dict = {"site_count": None, "short": False, "short_notes": [], "short_detail": [], "errors": [],
+                     "tabs": {}}
     job["listing"] = listing
     if job["kind"] == "video":
         take()
@@ -642,9 +645,11 @@ def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) 
         except Exception as e:  # noqa: BLE001 - a channel with no such tab raises
             log.error(f"{type(e).__name__}: {e}")
             info = None
+        name = url.rsplit('/', 1)[-1] if job['kind'] == 'channel' else 'the playlist'
         if not info or "entries" not in info:
             errors += 1
             counts.append(None)
+            listing["tabs"][name] = {"count": None, "ids": [], "short": False}
             continue
         raw = [e for e in (info["entries"] or []) if e]
         for e in raw:
@@ -652,12 +657,14 @@ def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) 
                 out.append(_entry(e, kind, info))
         total = _count(info.get("playlist_count"))
         counts.append(total)
-        name = url.rsplit('/', 1)[-1] if job['kind'] == 'channel' else 'the playlist'
         note = cut_short(len(raw), total, end, page=30 if job["kind"] == "channel" else 100)
+        short = bool(note) and total is not None    # fewer than the site's own count; without a count it is a guess
+        listing["tabs"][name] = {"count": total, "short": short,
+                                 "ids": [str(e.get("id") or f"#{i}") for i, e in enumerate(raw)]}
         if note:
             if f"{name}: {note}" not in job.setdefault("warnings", []):
                 job["warnings"].append(f"{name}: {note}")
-            if total is not None:          # fewer than the site's own count; without a count it is a guess
+            if short:
                 listing["short"] = True
                 listing["short_notes"].append(f"{name}: {note}")
                 listing["short_detail"].append(f"{name}: listed {len(raw)} of {total}")
@@ -888,6 +895,9 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
         job["listing"] = {}
         got = lister(job, proxy, take=lambda: rate.take(stop_file.exists))
         info = dict(job.get("listing") or {})
+        # the per-tab entry ids are for judging a second listing only: kept out of the job record,
+        # which is written again on every save
+        job["listing"] = {k: v for k, v in info.items() if k != "tabs"}
         for err in info.get("errors") or []:
             log(f"listing over {config.mask_proxy(proxy)}: yt-dlp: {err}")
         return got, info
@@ -944,19 +954,31 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                 if len(again) > first_len:     # the longer listing's order: it holds the newest first
                     have = {v["video_id"] for v in again}
                     listed = list(again) + [v for v in listed if v["video_id"] not in have]
-                # Judged on everything listed, against the largest count either listing gave. Only a
-                # second listing longer than the first can show that the first was what was cut.
-                seen_counts = [c for c in (info.get("site_count"), info2.get("site_count")) if c is not None]
-                most = max(seen_counts) if seen_counts else None
+                # Judged tab by tab: each tab on the entries both listings found in it, against the
+                # larger count either gave for it (cut_short, with its own tolerance). A tab that
+                # either listing found short stays short unless its second listing was the longer
+                # and the two together pass. The listing is whole only when every tab is.
                 page = 30 if job["kind"] == "channel" else 100
-                whole = len(again) > first_len and most is not None and not cut_short(len(listed), most, None, page)
-                short = not whole and not (cap and len(listed) >= cap)
-                info = {**info, "site_count": most, "short": short,
-                        "short_detail": [f"listed {len(listed)} of {most}"] if most is not None else first_detail}
+                t1, t2 = info.get("tabs") or {}, info2.get("tabs") or {}
+                tab_counts, still = [], []
+                for name in list(t1) + [x for x in t2 if x not in t1]:
+                    a, b = t1.get(name) or {}, t2.get(name) or {}
+                    ids = list(dict.fromkeys(list(a.get("ids") or []) + list(b.get("ids") or [])))
+                    seen_counts = [c for c in (a.get("count"), b.get("count")) if c is not None]
+                    most = max(seen_counts) if seen_counts else None
+                    tab_counts.append(most)
+                    if (a.get("short") or b.get("short")) and not (
+                            len(b.get("ids") or []) > len(a.get("ids") or [])
+                            and not cut_short(len(ids), most, None, page)):
+                        still.append(f"{name}: listed {len(ids)}" + (f" of {most}" if most is not None else ""))
+                site_all = sum(tab_counts) if tab_counts and all(c is not None for c in tab_counts) else None
+                short = bool(still) and not (cap and len(listed) >= cap)
+                info = {**info, "site_count": site_all, "short": short, "short_detail": still or first_detail}
                 log(f"listed again over {listed_over[1]}: {len(again)}; {len(listed)} in all"
                     + ("" if short else ", so the listing is taken as whole"))
-                if not short:              # the first listing's cut-short warnings no longer hold
-                    job["warnings"] = [w for w in job.get("warnings") or [] if w not in first_notes]
+                if not short:              # neither listing's cut-short warnings hold any more
+                    gone = set(first_notes) | set(info2.get("short_notes") or [])
+                    job["warnings"] = [w for w in job.get("warnings") or [] if w not in gone]
                     job["warnings"].append(f"the first listing, over {listed_over[0]}, looked cut short ("
                                            + "; ".join(first_detail)
                                            + f"); listed again over {listed_over[1]}: {len(listed)} in all")
@@ -1176,8 +1198,10 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                 elif len(listed) > len(selected):
                     msg += f"; at least {len(listed) - len(selected)} more not tried because of max_videos={cap}"
             if short:
-                cut = (f"listed {len(listed)} of {site}" if site is not None
-                       else "; ".join(info.get("short_detail") or []) or f"listed {len(listed)}")
+                detail = "; ".join(info.get("short_detail") or [])
+                cut = (f"listed {len(listed)} of {site}" if site is not None else detail or f"listed {len(listed)}")
+                if job["kind"] == "channel" and site is not None and detail:
+                    cut += f" ({detail})"          # which tab was short, by its own count
                 over = (f", over {listed_over[0]} and again over {listed_over[1]}" if len(listed_over) > 1 else
                         f" over {listed_over[0]}, and there was no other route to list it again over")
                 save(state="partial", ended=time.time(),
