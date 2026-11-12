@@ -92,6 +92,8 @@ Settings are read from your environment, or from a file named `.env` in the data
 | `EXPERTISE_MINER_HOME` | The data folder. Environment only | `.expertise-miner` in your home folder |
 | `EXPERTISE_MINER_PYTHON` | The Python to run under. Environment only | Found automatically |
 | `EXPERTISE_MINER_DB` | The SQLite file | `corpus.db` in the data folder |
+| `EXPERTISE_MINER_SEARCH_STEMMING` | `on` or `off`: whether a word also finds its other forms | `on` |
+| `EXPERTISE_MINER_SEARCH_MATCH` | `ranked` or `all`: how a search treats its words unless the search says otherwise | `ranked` |
 | `EXPERTISE_MINER_STORE` | `mongo` to use MongoDB | `sqlite` |
 | `MONGO_URI`, or `MONGO_HOST` `MONGO_PORT` `MONGO_USER` `MONGO_PASS` `MONGO_AUTH_SOURCE` | The MongoDB server | |
 | `MONGO_DB`, `MONGO_COLLECTION` | Where in it | `expertise_miner`, `videos` |
@@ -99,9 +101,27 @@ Settings are read from your environment, or from a file named `.env` in the data
 | `PROXY_PORT_COUNT` | Use this many consecutive ports of `PROXY_URL` as separate routes | 1 |
 | `PROXY_URLS` | A comma-separated list of proxies, used in place of `PROXY_URL` | |
 
+### Search
+
+Transcripts are cut into passages of about half a minute, and search works on passages, so a result is the moment something was said and not just the video it is somewhere in. A video's title is searched as part of its first passage: a word that is only in the title returns that first passage, which may not say the word.
+
+| Option | What it does | Default | Change it |
+|---|---|---|---|
+| Stemming | A word also finds its other forms: `stack` finds "stacking" and "stacked". English rules; it also joins some words that only look related | on | `EXPERTISE_MINER_SEARCH_STEMMING`. The index is rebuilt the next time the corpus is opened, which means after Claude Code is restarted. Every session using the corpus must have the same setting, or each rebuilds it the other way |
+| Match | `ranked`: every passage holding any of the words is a candidate, and those holding more of them, and rarer ones, come first; a quoted phrase is one such term, not a requirement. `all`: only passages holding every word and phrase | `ranked` | `EXPERTISE_MINER_SEARCH_MATCH`, or `match` on one search |
+| Several wordings | One search can carry up to 8 wordings of the same question. Each is searched, the best 60 passages of each are kept, and the rankings are merged: a passage near the top for any wording does well, one found by several does better. A wording made only of common words counts as much as a good one | used when given | `queries` on a search |
+
+A phrase in double quotes is matched as written, give or take stemming. It may run across the join between two passages when no more than 12 of its words fall on either side; a longer quote that straddles a join is not found, so search for a shorter piece of it. Passages found by a phrase across a join are listed first, ahead of the ranked ones, and at most ten of them. A single word never counts for the passage before the one it is in.
+
+Stemming and ranking by how rare a word is come from SQLite's full-text module (FTS5), which nearly every Python has; `setup_check` says whether yours does. Without it, and on MongoDB, passages are ranked by how many of the words they hold, in their exact forms, and passages that tie come out in the order of their video ids.
+
+**Updating from 0.1.** Let any running pull finish before you update. The first time 0.2 opens a corpus made by 0.1 it re-indexes it by passage, a video at a time; nothing is fetched again. Expect something like a minute per thousand hours of video (measured on one machine, on a made-up corpus of a few hundred hours; yours may differ), during which searches see only what has been indexed so far. If it is interrupted it carries on at the next start.
+
+This is still a search by words. It finds "how much I put in play each night" for a search about bankroll only when one of the wordings uses those words. That is what the several-wordings option is for: Claude supplies the rephrasings.
+
 ### MongoDB
 
-MongoDB is used only when `EXPERTISE_MINER_STORE=mongo`. Mongo settings that are in your environment for some other tool are never picked up by accident. Search there is a scan with regular expressions, which is fine for a few thousand videos.
+MongoDB is used only when `EXPERTISE_MINER_STORE=mongo`. Mongo settings that are in your environment for some other tool are never picked up by accident. Search there has no index: the matching videos are found with regular expressions, at most 40 of them and the most viewed first, and their passages are ranked by how many of the words each holds. There is no stemming and no ranking by how rare a word is. With ranked matching and a common word in the search, those 40 can all be videos that hold only the common word; use `match: "all"` or rarer words there. That is fine for a few thousand videos.
 
 A collection written by another tool can be read as it is, as long as each record has `video_id` and `transcript`. Such records have no timed lines, so they can be searched but not mined with timestamps until they are pulled again with `refresh`.
 
@@ -146,7 +166,7 @@ These limits are per pull and per data folder. Nothing stops someone from runnin
 | `pull_status` | Progress of a job, or the recent jobs |
 | `pull_resume` | Starts a stopped, blocked, failed or dead job again; skips what is stored |
 | `pull_stop` | Asks a running pull to stop after the request it is on |
-| `search_transcripts` | Word and phrase search, with timed passages |
+| `search_transcripts` | Ranked word and phrase search over passages, for one wording or several |
 | `get_transcript` | One transcript as timed lines, in parts |
 | `list_corpus` | Channels, or a channel's videos |
 | `mine_prepare` | Writes the chosen transcripts into a run folder for readers |
@@ -159,7 +179,7 @@ The mining tools write only inside the run folder they are given, under fixed na
 
 ## Limits worth knowing
 
-- **Search is by words, not meaning.** There are no embeddings. Ask in several wordings.
+- **Search is by words, not meaning.** It ranks passages, knows a word's other forms and merges several wordings, but there are no embeddings: a passage that says it in words no wording used is not found.
 - **Captions are often machine-made**: no punctuation, misheard names. Quotes are kept exactly as stored, errors included.
 - **A channel listing is newest first.** There is no "most viewed first"; `min_views` filters within the videos selected.
 - **A pull that dies** (the machine slept, the process was killed) is noticed when its record has not been updated for 90 seconds. What it stored is kept, and `pull_resume` continues. A worker that was only frozen stands down when it wakes and finds that another pull has taken its place.
