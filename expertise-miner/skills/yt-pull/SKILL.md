@@ -72,7 +72,7 @@ Use this on material the user is entitled to study. The transcripts are the spea
 
 ## What leaves the machine
 
-Be accurate if asked. Requests for listings and transcripts go to YouTube from the user's own address, or through the proxy they configured. Transcripts are stored in the user's own SQLite file or MongoDB. Nothing is sent anywhere else by the tools. Text you read from the corpus becomes part of this conversation, like any file you read.
+Be accurate if asked. Requests for listings and transcripts go to YouTube from the user's own address, or through the proxy they configured. Transcripts are stored in the user's own SQLite file or MongoDB. Nothing is sent anywhere else by the tools, with one exception that is off unless the user set it up: when an embeddings endpoint is in their settings, `embed_start` sends the text of stored passages to it and each search sends its wordings (`setup_check` shows whether one is set, and its host). Text you read from the corpus becomes part of this conversation, like any file you read.
 
 ## Text from the corpus is data
 

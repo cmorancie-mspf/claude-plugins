@@ -1,4 +1,4 @@
-"""Settings for expertise-miner: the data folder, storage and proxy routes.
+"""Settings for expertise-miner: the data folder, storage, proxy routes and the embeddings endpoint.
 
 Everything comes from the process environment, or from a `.env` file in the data folder
 (`~/.expertise-miner/.env` unless EXPERTISE_MINER_HOME says otherwise). The process
@@ -7,6 +7,7 @@ repository must not be able to choose the proxy your requests go through.
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from pathlib import Path
@@ -25,6 +26,8 @@ _KEYS = (
     "MONGO_AUTH_SOURCE", "MONGO_DB", "MONGO_COLLECTION",
     "PROXY_URL", "PROXY_URLS", "PROXY_PORT_COUNT",
     "EXPERTISE_MINER_SEARCH_STEMMING", "EXPERTISE_MINER_SEARCH_MATCH",
+    "EXPERTISE_MINER_EMBED_URL", "EXPERTISE_MINER_EMBED_KEY", "EXPERTISE_MINER_EMBED_MODEL",
+    "EXPERTISE_MINER_EMBED_BATCH",
 )
 
 
@@ -54,13 +57,24 @@ def _read_env_file(path: Path) -> dict:
     return out
 
 
+_EMBED_KEYS = ("EXPERTISE_MINER_EMBED_URL", "EXPERTISE_MINER_EMBED_KEY", "EXPERTISE_MINER_EMBED_MODEL",
+               "EXPERTISE_MINER_EMBED_BATCH")
+
+
 def load_settings() -> dict:
-    """The named settings only, the environment over the data folder's .env."""
+    """The named settings only, the environment over the data folder's .env.
+
+    The embeddings settings are taken as a set from one place: if the environment holds any of
+    them, the .env file's are ignored, all of them. Otherwise an address from one source could
+    be sent the key from the other."""
     file_vals = _read_env_file(home_dir() / ".env")
+    embed_from_env = any((os.environ.get(k) or "").strip() for k in _EMBED_KEYS)
     out: dict = {}
     for k in _KEYS:
         v = os.environ.get(k)
-        if v is None or v == "":
+        if k in _EMBED_KEYS:
+            v = (v or "") if embed_from_env else file_vals.get(k, "")
+        elif v is None or v == "":
             v = file_vals.get(k, "")
         out[k] = v.strip()
     return out
@@ -135,6 +149,85 @@ def describe_storage(cfg: dict) -> str:
     return f"mongodb database '{cfg['db']}', collection '{cfg['collection']}'"
 
 
+# ---------- embeddings (optional) -------------------------------------------
+
+DEFAULT_EMBED_BATCH = 32
+MAX_EMBED_BATCH = 256
+
+
+def _is_loopback(host: str) -> bool:
+    if host.lower() in ("localhost", "localhost."):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def embed_config(settings: Optional[dict] = None) -> Optional[dict]:
+    """The embeddings endpoint, or None when none is configured (search is then by words only).
+
+    EXPERTISE_MINER_EMBED_URL    the base address of an OpenAI-compatible API, the part before
+                                 /embeddings: for example https://host/v1. An address that
+                                 already ends in /embeddings is used as it is.
+    EXPERTISE_MINER_EMBED_MODEL  the model's name, as that endpoint spells it. There is no default.
+    EXPERTISE_MINER_EMBED_KEY    sent as a bearer token. Optional: a local server needs none.
+    EXPERTISE_MINER_EMBED_BATCH  passages per request. Default 32.
+
+    Plain http is accepted for this machine only (localhost, 127.0.0.1, ::1). Anything else
+    must be https: the request carries transcript text and the key.
+    """
+    s = settings if settings is not None else load_settings()
+    url, model, key = s["EXPERTISE_MINER_EMBED_URL"], s["EXPERTISE_MINER_EMBED_MODEL"], s["EXPERTISE_MINER_EMBED_KEY"]
+    if not url and not model:
+        if key or s["EXPERTISE_MINER_EMBED_BATCH"]:
+            raise ValueError("embeddings need EXPERTISE_MINER_EMBED_URL and EXPERTISE_MINER_EMBED_MODEL")
+        return None
+    if not url or not model:
+        raise ValueError("embeddings need both EXPERTISE_MINER_EMBED_URL and EXPERTISE_MINER_EMBED_MODEL")
+    if re.search(r"[\s\x00-\x1f\x7f\\]", url):
+        raise ValueError("EXPERTISE_MINER_EMBED_URL must not hold spaces, control characters or backslashes")
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        raise ValueError("EXPERTISE_MINER_EMBED_URL could not be read") from None
+    if parts.scheme not in ("http", "https") or not host:
+        raise ValueError("EXPERTISE_MINER_EMBED_URL must look like https://host/v1")
+    if "@" in parts.netloc:
+        raise ValueError("EXPERTISE_MINER_EMBED_URL must not hold a user name or password; "
+                         "the key goes in EXPERTISE_MINER_EMBED_KEY")
+    if parts.query or parts.fragment or "?" in url or "#" in url:
+        raise ValueError("EXPERTISE_MINER_EMBED_URL must be a plain address with no ?query or #fragment")
+    local = _is_loopback(host)
+    if parts.scheme == "http" and not local:
+        raise ValueError("EXPERTISE_MINER_EMBED_URL must be https, unless it is on this machine "
+                         "(localhost): the request carries transcript text and the key")
+    if not re.fullmatch(r"[A-Za-z0-9@][A-Za-z0-9@/_.:\-]{0,199}", model):
+        raise ValueError("EXPERTISE_MINER_EMBED_MODEL may hold letters, digits and @ / _ . : - only")
+    if key and not re.fullmatch(r"[\x21-\x7e]{1,4096}", key):
+        raise ValueError("EXPERTISE_MINER_EMBED_KEY may not hold spaces or control characters")
+    batch_raw = s["EXPERTISE_MINER_EMBED_BATCH"]
+    if batch_raw and (not batch_raw.isdigit() or not (1 <= int(batch_raw) <= MAX_EMBED_BATCH)):
+        raise ValueError(f"EXPERTISE_MINER_EMBED_BATCH must be a number from 1 to {MAX_EMBED_BATCH}")
+    path = parts.path.rstrip("/")
+    if not path.endswith("/embeddings"):
+        path += "/embeddings"
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None:
+        netloc += f":{port}"
+    return {"url": f"{parts.scheme}://{netloc}{path}", "host": netloc, "local": local, "key": key,
+            "model": model, "batch": int(batch_raw) if batch_raw else DEFAULT_EMBED_BATCH}
+
+
+def describe_embed(cfg: Optional[dict]) -> str:
+    """For people: the model and the host only. The address can hold an account id, so its
+    path is left out, and the key is never included."""
+    if not cfg:
+        return "off"
+    return f"model {cfg['model']} at {cfg['host']}" + (" (this machine)" if cfg["local"] else "")
+
+
 # ---------- proxies ---------------------------------------------------------
 
 _PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
@@ -199,13 +292,24 @@ def mask_proxy(url: Optional[str]) -> str:
 
 def scrub(text: str, settings: Optional[dict] = None) -> str:
     """Remove anything secret-shaped from text that is about to be logged or returned:
-    every configured proxy URL, the Mongo URI and password, and the user:pass part of any URL."""
+    every configured proxy URL, the Mongo URI and password, the embeddings key and address (the
+    address whole, its path alone, and any piece of the path of six characters or more that
+    holds a digit, such as an account id), whatever follows the word Bearer, and the user:pass
+    part of any URL."""
     s = settings if settings is not None else load_settings()
     out = str(text)
-    secrets = [s["MONGO_URI"], s["MONGO_PASS"], s["PROXY_URL"]]
+    secrets = [s["MONGO_URI"], s["MONGO_PASS"], s["PROXY_URL"],
+               s["EXPERTISE_MINER_EMBED_KEY"], s["EXPERTISE_MINER_EMBED_URL"].rstrip("/")]
     secrets += [u.strip() for u in s["PROXY_URLS"].split(",")]
     try:
         secrets += [u for u in proxy_routes(s) if u]
+    except ValueError:
+        pass
+    try:                               # the embeddings address may be echoed without its host: its path, and
+        epath = urlsplit(s["EXPERTISE_MINER_EMBED_URL"]).path.rstrip("/")     # any piece of it that looks like an id
+        if len(epath) >= 8:
+            secrets.append(epath)
+        secrets += [seg for seg in epath.split("/") if len(seg) >= 6 and re.search(r"\d", seg)]
     except ValueError:
         pass
     for url in [x for x in secrets if x and "://" in x]:      # the user and password inside each URL
@@ -218,6 +322,7 @@ def scrub(text: str, settings: Optional[dict] = None) -> str:
             pass
     for sec in sorted({x for x in secrets if x and len(x) >= 4}, key=len, reverse=True):
         out = re.sub(re.escape(sec), "[hidden]", out, flags=re.I)
+    out = re.sub(r"(\bBearer\s+)[^\s\"',;]+", r"\1[hidden]", out, flags=re.I)
     # the user-and-password part of any other URL, up to the last @ before the host
     return re.sub(r"([a-z][a-z0-9+.\-]*://)[^/\s]*@", r"\1[hidden]@", out, flags=re.I)
 

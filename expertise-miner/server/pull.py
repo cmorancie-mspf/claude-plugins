@@ -153,7 +153,7 @@ def read_job(job_id: str) -> dict:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            raise PullError(f"no pull job with id {job_id}") from None
+            raise PullError(f"no job with id {job_id}") from None
         except (ValueError, PermissionError):
             time.sleep(0.05 * (attempt + 1))
     raise PullError(f"the record of job {job_id} could not be read")
@@ -184,12 +184,18 @@ def active_job() -> Optional[dict]:
     return None
 
 
-def _acquire_slot(job_id: str) -> None:
-    """One pull at a time per data folder. Two pulls from one address double the rate it sees."""
-    lock = jobs_dir() / "active.lock"
+PULL_LOCK = "active.lock"     # pulls
+EMBED_LOCK = "embed.lock"     # embedding runs (embed.py): they do not touch the site, so they have their own slot
+
+
+def _acquire_slot(job_id: str, lock_name: str = PULL_LOCK) -> None:
+    """One pull at a time per data folder. Two pulls from one address double the rate it sees.
+    An embedding run takes a slot of its own in the same way, under another name."""
+    what, stop = ("a pull", "pull_stop") if lock_name == PULL_LOCK else ("an embedding run", "embed_stop")
+    lock = jobs_dir() / lock_name
     mine = jobs_dir() / f"{job_id}.slot"
     mine.write_text(job_id, encoding="utf-8")
-    busy = PullError("a pull is already running. One pull runs at a time: wait for it, or stop it with pull_stop.")
+    busy = PullError(f"{what} is already running. One runs at a time: wait for it, or stop it with {stop}.")
     try:
         try:
             os.link(mine, lock)            # appears complete or not at all: the lock is never empty
@@ -215,14 +221,14 @@ def _acquire_slot(job_id: str) -> None:
         except PullError:
             held = False
         if held:
-            raise PullError(f"a pull is already running (job {holder}). One pull runs at a time: "
-                            f"wait for it, or stop it with pull_stop.")
+            raise PullError(f"{what} is already running (job {holder}). One runs at a time: "
+                            f"wait for it, or stop it with {stop}.")
         try:
             os.replace(mine, lock)         # the holder ended or died: take the slot over in one step
         except OSError:
             raise busy from None           # someone else is taking it over at this moment
         time.sleep(0.05)
-        if slot_holder() != job_id:        # someone else took it over at the same moment
+        if slot_holder(lock_name) != job_id:   # someone else took it over at the same moment
             raise busy
     finally:
         try:
@@ -231,15 +237,15 @@ def _acquire_slot(job_id: str) -> None:
             pass
 
 
-def slot_holder() -> str:
+def slot_holder(lock_name: str = PULL_LOCK) -> str:
     try:
-        return (jobs_dir() / "active.lock").read_text(encoding="utf-8").strip()
+        return (jobs_dir() / lock_name).read_text(encoding="utf-8").strip()
     except OSError:
         return ""
 
 
-def _release_slot(job_id: str) -> None:
-    lock = jobs_dir() / "active.lock"
+def _release_slot(job_id: str, lock_name: str = PULL_LOCK) -> None:
+    lock = jobs_dir() / lock_name
     try:
         if lock.read_text().strip() == job_id:
             lock.unlink()
@@ -293,9 +299,14 @@ def create_job(spec: dict) -> dict:
     """Validate a request, record it, and start its worker. Returns the job record."""
     job = build_job(spec)
     check_cooldown(job)
+    return launch(job, Path(__file__).resolve(), PULL_LOCK)
+
+
+def launch(job: dict, script: Path, lock_name: str) -> dict:
+    """Record a job, take its slot and start `script run <id>` as a process of its own."""
     write_job(job)                # before the slot, so whoever reads the slot finds a record
     try:
-        _acquire_slot(job["id"])
+        _acquire_slot(job["id"], lock_name)
     except Exception:
         _job_path(job["id"]).unlink(missing_ok=True)
         raise
@@ -303,7 +314,7 @@ def create_job(spec: dict) -> dict:
         log_path = jobs_dir() / f"{job['id']}.log"
         with open(log_path, "ab") as log:
             kw: dict = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log, "close_fds": True}
-            cmd = [sys.executable, str(Path(__file__).resolve()), "run", job["id"]]
+            cmd = [sys.executable, str(script), "run", job["id"]]
             if os.name == "nt":
                 flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
                 try:
@@ -315,7 +326,7 @@ def create_job(spec: dict) -> dict:
         job["pid"] = proc.pid
         return job
     except Exception:
-        _release_slot(job["id"])
+        _release_slot(job["id"], lock_name)
         job.update(state="failed", message="the worker could not be started", ended=time.time())
         write_job(job)
         raise
@@ -327,7 +338,7 @@ def request_stop(job_id: str) -> dict:
         return {"id": job_id, "state": effective_state(job), "note": "this job is not running"}
     (jobs_dir() / f"{job_id}.stop").write_text("stop", encoding="utf-8")
     return {"id": job_id, "state": "stopping",
-            "note": "the worker stops after the request it is on; read pull_status in a few seconds"}
+            "note": "the worker stops after the request it is on; read its status in a few seconds"}
 
 
 def shell_command(argv: list) -> str:
@@ -341,8 +352,8 @@ def shell_command(argv: list) -> str:
     return " ".join(shlex.quote(a) for a in argv)
 
 
-def wait_command(job_id: str) -> str:
-    return shell_command([sys.executable, str(Path(__file__).resolve()), "wait", job_id])
+def wait_command(job_id: str, script: Optional[Path] = None) -> str:
+    return shell_command([sys.executable, str(script or Path(__file__).resolve()), "wait", job_id])
 
 
 def check_cooldown(job: dict) -> None:
@@ -359,7 +370,8 @@ def check_cooldown(job: dict) -> None:
                         "better; a different proxy route is not held back.")
 
 
-# ---------- listing and fetching (the only code that touches the network) -------
+# ---------- listing and fetching (the only code that contacts the site; embed.py is the only
+# other code that opens a connection, and only to the embeddings endpoint in the settings) -------
 
 
 class _Quiet:

@@ -37,6 +37,7 @@ Say them plainly; do not bury them.
 - It registers an MCP server, `expertise-miner`, in every Claude Code session.
 - It needs Python packages for pulling, installed only with the person's agreement.
 - Transcripts are stored in a file in the person's home folder. Transcript text you read enters the conversation.
+- Search is by words and stays on the machine. Search by meaning is an optional extra that is off until the person sets an embeddings endpoint; with a hosted endpoint, the text of the stored transcripts and the wording of each search are sent to it, and embedding a corpus may cost money.
 - What it mines is what speakers said, with the quote and the moment. It does not check that any of it is true.
 
 Install only after the person has heard this and still wants it.
@@ -76,8 +77,9 @@ Do not do these for them, and do not ask for the secrets involved.
 - **Sign OpenCode in to a model provider**: `opencode auth login`. Then they confirm it works with `opencode run -m <provider/model> "Reply with only OK."`. A free tier will run out part-way through a build; they should use a provider they pay for.
 - **Agree to each `pip install`** that `transcribe` needs. Its set-up check prints the exact command for the Python in use.
 - **Agree to the `pip install`** that `expertise-miner` needs before its first pull. Its `setup_check` tool prints the exact command for the Python in use.
-- **Put any credentials in place.** A proxy address or a MongoDB connection for `expertise-miner` goes in the person's environment or in the `.env` file whose path `setup_check` prints. The plugin's `.env.example` lists the names. Do not ask for these values, and do not write them yourself.
+- **Put any credentials in place.** A proxy address, a MongoDB connection or an embeddings endpoint and its key for `expertise-miner` goes in the person's environment or in the `.env` file whose path `setup_check` prints. The plugin's `.env.example` lists the names. Do not ask for these values, and do not write them yourself.
 - **Decide what to pull, and how much.** Do not start a pull as part of installing.
+- **Decide whether transcript text may go to an embeddings endpoint, and pay for it.** Do not set one up or start an embedding run as part of installing.
 - **Decide which permissions to grant.** The build loop of `rebuild-factory` needs the `oc-bridge` tools, git, node and background shell commands allowed in the project. Grant them for that project only, and only when the person is about to run the build stage. Do not widen permissions as part of installing.
 - **Accept a plan folder.** If a repository already contains a `factory-plan/` folder, the plugin refuses it until the person has been shown the commands it would run. You show them; they decide. Never accept it on your own judgement.
 
@@ -95,6 +97,7 @@ Report to the person: what was installed, which prerequisites are present and wh
 
 - Do not start a builder, an audit, a transcription or a pull as part of installing.
 - Do not raise the worker count or lower the delay of `expertise-miner` on your own judgement, and do not resume a pull that ended `blocked` straight away.
+- Do not start an embedding run of `expertise-miner` (`embed_start`) without telling the person how much text goes to which host and getting a yes.
 - Do not edit the person's Claude Code settings, permission rules or global OpenCode config.
 - Do not edit the plugin's files in its install folder. A project's own rules file is `factory-plan/builder-rules.json`, created at set-up.
 - Do not pass `no_rules` or `allow_project_config` to the bridge, and do not run `factory.mjs trust --yes`, unless the person has said so in their own words after being shown what it does.
