@@ -28,7 +28,7 @@ _KEYS = (
     "EXPERTISE_MINER_SEARCH_STEMMING", "EXPERTISE_MINER_SEARCH_MATCH",
     "EXPERTISE_MINER_EMBED_URL", "EXPERTISE_MINER_EMBED_KEY", "EXPERTISE_MINER_EMBED_MODEL",
     "EXPERTISE_MINER_EMBED_BATCH",
-    "EXPERTISE_MINER_WORKERS", "EXPERTISE_MINER_DELAY_MS",
+    "EXPERTISE_MINER_WORKERS", "EXPERTISE_MINER_DELAY_MS", "EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE",
 )
 
 
@@ -371,17 +371,26 @@ def scrub(text: str, settings: Optional[dict] = None) -> str:
     return re.sub(r"([a-z][a-z0-9+.\-]*://)[^/\s]*@", r"\1[hidden]@", out, flags=re.I)
 
 
+MAX_REQUESTS_PER_MINUTE = 600
+
+
 def pull_rate(settings: Optional[dict] = None) -> dict:
-    """The pull defaults from the settings: {'workers': n or None, 'delay_ms': n or None}.
+    """The pull defaults from the settings: {'workers', 'delay_ms', 'max_requests_per_minute'},
+    each a number or None.
 
     EXPERTISE_MINER_WORKERS   workers for a pull that does not say. Still never more than the
                               distinct routes, and at most MAX_WORKERS.
     EXPERTISE_MINER_DELAY_MS  the pause per worker for a pull that does not say. Still never under
                               MIN_DELAY_MS.
-    A value given on a pull wins over both."""
+    EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE
+                              a limit on requests to the site for the whole pull, all workers
+                              together, 1 to MAX_REQUESTS_PER_MINUTE. None: no limit.
+    A value given on a pull wins over each."""
     s = settings if settings is not None else load_settings()
     out: dict = {}
-    for key, name, top in (("workers", "EXPERTISE_MINER_WORKERS", 1000), ("delay_ms", "EXPERTISE_MINER_DELAY_MS", 600_000)):
+    for key, name, top in (("workers", "EXPERTISE_MINER_WORKERS", 1000), ("delay_ms", "EXPERTISE_MINER_DELAY_MS", 600_000),
+                           ("max_requests_per_minute", "EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE",
+                            MAX_REQUESTS_PER_MINUTE)):
         raw = s[name]
         if not raw:
             out[key] = None

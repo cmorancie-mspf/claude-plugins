@@ -33,9 +33,11 @@ Pass what the user typed for the channel: `@handle`, a channel address, or a `UC
 `pull_channel` and `pull_playlist` return at once with a job id and a `wait_command`. The pull runs in its own process and survives the end of this session.
 
 1. Start the pull.
-2. Start `wait_command` as a **background** shell command (in PowerShell, `wait_command_powershell`). It ends when the pull ends: exit 0 done, 1 failed or stopped, 2 blocked by the site, 3 the worker went quiet.
+2. Start `wait_command` as a **background** shell command (in PowerShell, `wait_command_powershell`). It ends when the pull ends: exit 0 done, 1 failed or stopped, 2 blocked by the site, 3 the worker went quiet, 4 partial.
 3. Tell the user it is running, roughly how long it will take (`pull_status` gives `rough_seconds_left`), and carry on with anything else they want.
-4. When it ends, read `pull_status` with the job id and report the counts.
+4. When it ends, read `pull_status` with the job id and report the counts, and any warning in `message`.
+
+A pull ends in one of these states: `done`; `partial`: the playlist or tab listed short of the count the site gives, even when listed again over another route, so what was listed was pulled and the rest was never seen (the message says `listed 99 of 174: the listing may have been cut short`). Short means more than 5 entries and more than 5% short, or short at all while ending on a whole page (100 for a playlist, 30 for a channel tab); `blocked`: every route was taken out; `stopped`; `failed`; or `died`, when the worker stopped reporting. After `partial`, tell the user how many were listed against the site's count, and offer `pull_resume`, which lists again; it is not a refusal of every route, but the listing was likely refused a page, so do not resume at once in a loop. If a resumed pull ends `partial` with the very same numbers, the playlist probably counts videos the site does not list (private or removed ones): say so rather than resume again.
 
 `pull_video` is for one video: it waits up to 45 seconds and returns the outcome.
 
@@ -45,7 +47,7 @@ One pull runs at a time per data folder. A second is refused while the first is 
 
 The defaults are slow on purpose: one worker and 1.5 seconds between videos. Each video is a transcript fetch and a read of its page for the date and view count, and each of those is several HTTP requests.
 
-- Do not lower `delay_ms` or raise `workers` unless the user asks, and say what it does when they do. The user may have set their own defaults in the settings (`EXPERTISE_MINER_WORKERS`, `EXPERTISE_MINER_DELAY_MS`; `setup_check` shows them as `pull_defaults`): leave both out of a pull to use them. The tools enforce a floor on the delay and never run more workers than there are distinct proxy routes, because two workers on one address only double what that address sends.
+- Do not lower `delay_ms`, raise `workers` or raise or remove a request limit unless the user asks, and say what it does when they do. The user may have set their own defaults in the settings (`EXPERTISE_MINER_WORKERS`, `EXPERTISE_MINER_DELAY_MS`, `EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE`; `setup_check` shows them as `pull_defaults`): leave them out of a pull to use them. `max_requests_per_minute` limits the whole pull, all workers together; it is off unless set. If pulls through a mobile proxy keep ending `blocked`, a limit (the settings file suggests 6) is worth offering; `pull_status` shows the rate the pull has run at (`requests_per_minute`). The tools enforce a floor on the delay and never run more workers than there are distinct proxy routes, because two workers on one address only double what that address sends.
 - `details: false` skips the date and view count and makes a pull lighter. Offer it for a very large pull where dates do not matter. `min_views` needs the details.
 - When five videos in a row, on one route, get neither a transcript nor a definite "none", that route is taken out for the rest of the pull and a standby route takes over if one is left; `routes_out` in `pull_status` lists them. The pull ends **blocked** only when every route is out. That is the site saying stop. **Do not resume in a loop and do not retry at once.** A route the site refused is held back from new pulls for 30 minutes (only that route; a new pull uses the others and says which it held back); that is a floor, not a recommendation. Read the message to the user: without a proxy it says wait some hours or set one; with proxies it names the routes and says to wait for the provider to rotate them. Then `pull_resume`. Nothing stored is lost.
 - If the message says the proxy **refused the login** or **could not be reached**, the site did nothing: the user checks `PROXY_URL` or `PROXY_URLS` in their settings file. `proxy_test` checks each route; ask before running it.
@@ -54,10 +56,10 @@ The defaults are slow on purpose: one worker and 1.5 seconds between videos. Eac
 
 ## 5. Resume, stop, check coverage
 
-- `pull_resume` with the job id starts again with the same settings. Videos already stored are skipped, and so are videos recorded as having no transcript, so nothing is asked for twice. Use it after `stopped`, `blocked`, `failed` or `died`.
+- `pull_resume` with the job id starts again with the same settings and lists again. Videos already stored are skipped, and so are videos recorded as having no transcript, so nothing is asked for twice. Use it after `stopped`, `blocked`, `failed`, `died` or `partial`.
 - `pull_stop` ends a running pull after the request it is on.
 - Running the same `pull_channel` again later picks up new uploads the same way.
-- **Coverage.** Compare the job's `listed` and `selected` with `stored`. `failure_reasons` says why the rest are missing:
+- **Coverage.** In `counts`, `listed` is the entries the listing read, before `max_videos` applied: it is **not** the size of the playlist or channel. `site_count` is the size the site gives (none when it gave none). Compare those with `selected` and `stored`; when `max_videos` left videos out, the end message says how many. `refusals_by_route` counts, per route, videos the site gave no answer for without the route being taken out (`direct` is the user's own address; proxy failures are not counted there): tell the user about any, as a sign the route is going bad. `failure_reasons` says why the rest are missing:
 
 | Reason | Means | Worth retrying |
 |---|---|---|
