@@ -16,6 +16,11 @@
       "name": "transcribe",
       "source": "./transcribe",
       "description": "Turn a local audio or video file, or a URL, into a text transcript, processed on your own machine with faster-whisper. No API key, and the audio is not sent to any speech service. Timestamped lines, plain text or SubRip subtitles."
+    },
+    {
+      "name": "expertise-miner",
+      "source": "./expertise-miner",
+      "description": "Pull the transcripts of a YouTube channel, playlist or video into a searchable local corpus, then mine them for an expert's research questions, rules of thumb and research steps. Every mined item carries a quote checked word for word against the stored transcript, the video, the timestamp and a way to test it against data. Slow and polite by default; SQLite storage, with MongoDB and a proxy as optional settings. Ships an MCP server, three skills and a file-only reader agent."
     }
   ]
 }

@@ -10,6 +10,7 @@ A Claude Code plugin marketplace named `production-ai`. Each top-level folder wi
 |---|---|---|
 | `rebuild-factory` | Audits an existing codebase, plans a rebuild, and runs it as a loop in which a separate coding agent builds and every session is reviewed from a clean clone | `rebuild-factory/README.md`, then `rebuild-factory/references/` |
 | `transcribe` | Local speech-to-text for a file or a URL | `transcribe/README.md` |
+| `expertise-miner` | Pulls YouTube transcripts into a searchable corpus and mines them for an expert's questions, rules of thumb and research steps, with every quote checked against the transcript | `expertise-miner/README.md`, then `expertise-miner/server/` |
 
 If you were asked to **install** a plugin for someone, read `INSTALL.md`. If you were asked to **use** one, read `llms.txt` and that plugin's README. The rest of this file is for changing the repository.
 
@@ -22,7 +23,7 @@ If you were asked to **install** a plugin for someone, read `INSTALL.md`. If you
   skills/<name>/SKILL.md       one folder per skill; the folder name is the skill's name
   agents/<name>.md             subagents; the file name is the agent's name
   references/  templates/      read by the skills when needed
-  scripts/  bridge/            code the skills run
+  scripts/  bridge/  server/   code the skills run
   tests/                       tests for that code
 ```
 
@@ -37,10 +38,12 @@ node .github/check.mjs
 claude plugin validate .
 claude plugin validate ./<each plugin folder>
 node rebuild-factory/tests/test_factory.mjs
+python expertise-miner/tests/test_miner.py
 ```
 
 - `check.mjs` verifies the manifests, the skill and agent front matter, that every `${CLAUDE_PLUGIN_ROOT}` path exists, that every script parses, and that no machine path or secret-shaped string is committed. CI runs it and compiles the Python scripts.
 - `test_factory.mjs` uses a stand-in for OpenCode, calls no model and spends nothing. A few of its checks need git and OpenCode 2 installed.
+- `test_miner.py` uses the standard library only (`python3` where `python` is not on the path). Listing and transcript fetching are replaced by stand-ins: it contacts nothing and needs no package installed. Never make a test of `expertise-miner` send a real request.
 - `transcribe` has no committed tests. If you change `transcribe.py`, test it with a stand-in for the speech model; do not load a model in an automated check.
 
 ## Rules that must not be broken
@@ -51,7 +54,8 @@ node rebuild-factory/tests/test_factory.mjs
 4. **A plugin is published only after an independent review has approved it.** A reviewer that did not write the change reads the files, tries to break them, and says approve. Fix, and have the same reviewer check again, until it does. Do not add a plugin to `marketplace.json` before that.
 5. **One plugin per commit and per push** when publishing, so that each can be traced to its review.
 6. **Do not run a real builder, spend money or load a large model in a test.** Use a stub.
-7. **Bump the plugin's `version`** in its `plugin.json` when its behaviour changes.
+7. **Never weaken the quote check or the politeness limits of `expertise-miner`.** An item reaches the output only when its quote is found in the stored transcript; workers never exceed distinct routes; the delay has a floor; a run of refusals stops the pull; only YouTube addresses built from a parsed id reach the downloader; configured credentials are filtered from every log line, job record and tool result the code writes; `mine_build` never believes `verified.jsonl` without checking it again. A change that adds a way round any of these is a defect.
+8. **Bump the plugin's `version`** in its `plugin.json` when its behaviour changes.
 
 ## Adding a plugin
 

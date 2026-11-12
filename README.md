@@ -15,6 +15,7 @@ Then install a plugin by name:
 ```
 claude plugin install rebuild-factory@production-ai
 claude plugin install transcribe@production-ai
+claude plugin install expertise-miner@production-ai
 ```
 
 From a local copy of this repository, give the folder's path in place of `production-ai-eng/claude-plugins`.
@@ -27,6 +28,7 @@ If you are an AI agent: [INSTALL.md](INSTALL.md) is written for installing these
 |---|---|---|
 | [rebuild-factory](rebuild-factory/README.md) | Audit an existing codebase, write a plan a cheaper model can build from, and run the rebuild as a loop in which each small session is reproduced from a clean clone and attacked before it is merged | Early: see its notice |
 | [transcribe](transcribe/README.md) | Turn an audio or video file, or a URL, into a transcript, processed on your own machine. No API key; the audio is not sent to any speech service | In regular use on Windows; untried on macOS and Linux |
+| [expertise-miner](expertise-miner/README.md) | Pull a YouTube channel's transcripts into a searchable local corpus, then mine them for an expert's research questions, rules of thumb and research steps, each with a quote checked against the transcript, a timestamp and a way to test it | New: see its notice |
 
 ### rebuild-factory
 
@@ -63,6 +65,25 @@ Requires Node 20 or later and git; the build stage also needs [OpenCode](https:/
 ### transcribe
 
 Say "transcribe <file or URL>" in any chat. See [its README](transcribe/README.md). Requires Python 3.9 or later; on first use it checks what is missing and installs the packages only when you agree. The first run downloads a speech model of 0.5 to 3 GB.
+
+### expertise-miner
+
+For finding out how an expert actually works, from what they have said on YouTube. The rule behind it: **a reader's report proves nothing; only a quote found in the stored transcript counts.**
+
+> **Read this before you run it.**
+>
+> - It makes automated requests to YouTube from your address, slowly on purpose. YouTube may still refuse an address that asks for a lot; the pull then stops itself.
+> - Whether collecting and studying a channel's transcripts is acceptable for your purpose is your decision.
+> - Mined items report what was said. Nothing checks whether it is true.
+> - **Status: new.** Tried on Windows, on a handful of videos, with SQLite and no proxy.
+
+| Type | What happens |
+|---|---|
+| `/yt-pull @SomeChannel` | Pulls the channel's transcripts in the background, skipping what is already stored |
+| `/yt-search "some phrase"` | Finds where it was said, with quotes and links to the moment |
+| `/mine-expertise @SomeChannel` | One reader per video writes items; a tool rejects every item whose quote is not in the transcript; the rest are clustered into a question bank |
+
+Requires Node 18 or later and Python 3.9 or later. Pulling needs two Python packages, installed on first use only when you agree. Storage is a local SQLite file; MongoDB and a proxy are optional settings. See [its README](expertise-miner/README.md).
 
 ## Layout of this repository
 
