@@ -77,7 +77,7 @@ Do not do these for them, and do not ask for the secrets involved.
 - **Sign OpenCode in to a model provider**: `opencode auth login`. Then they confirm it works with `opencode run -m <provider/model> "Reply with only OK."`. A free tier will run out part-way through a build; they should use a provider they pay for.
 - **Agree to each `pip install`** that `transcribe` needs. Its set-up check prints the exact command for the Python in use.
 - **Agree to the `pip install`** that `expertise-miner` needs before its first pull. Its `setup_check` tool prints the exact command for the Python in use.
-- **Put any credentials in place.** A proxy address, a MongoDB connection or an embeddings endpoint and its key for `expertise-miner` goes in the person's environment or in the `.env` file whose path `setup_check` prints. The plugin's `.env.example` lists the names. Do not ask for these values, and do not write them yourself.
+- **Put any credentials in place.** A proxy address, a MongoDB connection or an embeddings endpoint and its key for `expertise-miner` goes in the person's environment or in the `.env` file whose path `setup_check` prints. The plugin's `.env.example` lists the names, and its `setup_write` tool can write that file from the person's answers to three questions, with placeholders where the secrets go. Do not ask for these values, and do not write them yourself.
 - **Decide what to pull, and how much.** Do not start a pull as part of installing.
 - **Decide whether transcript text may go to an embeddings endpoint, and pay for it.** Do not set one up or start an embedding run as part of installing.
 - **Decide which permissions to grant.** The build loop of `rebuild-factory` needs the `oc-bridge` tools, git, node and background shell commands allowed in the project. Grant them for that project only, and only when the person is about to run the build stage. Do not widen permissions as part of installing.
@@ -89,7 +89,7 @@ In a **new** session:
 
 - `rebuild-factory`: `/mcp` lists `oc-bridge`, and typing `/rebuild-factory` in a git repository offers to set the project up and runs a readiness check. The check calls no model and spends nothing. "Ready" means its checks passed; it does not mean a builder run is safe.
 - `transcribe`: saying "check that transcribe is set up" runs its set-up check, which loads no speech model and downloads nothing.
-- `expertise-miner`: `/mcp` lists `expertise-miner`, and its `setup_check` tool reports the Python in use, the packages, the storage and the routes. It contacts nothing. If the server is not listed, no Python of version 3.9 or later was found: the person sets `EXPERTISE_MINER_PYTHON` to the full path of one in their environment and starts a new session.
+- `expertise-miner`: `/mcp` lists `expertise-miner`, and its `setup_check` tool reports the Python in use, the packages, the storage and the routes. It contacts nothing, except the person's own MongoDB server when that is the store. If the server is not listed, no Python of version 3.9 or later was found: the person sets `EXPERTISE_MINER_PYTHON` to the full path of one in their environment and starts a new session.
 
 Report to the person: what was installed, which prerequisites are present and which are missing, what they still have to do themselves, and that a new session is needed.
 

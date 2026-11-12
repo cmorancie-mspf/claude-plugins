@@ -94,6 +94,14 @@ def _switch(name: str, raw: str, default: bool) -> bool:
     raise ValueError(f"{name} must be on or off")
 
 
+def _not_placeholder(name: str, value: str, words: tuple) -> None:
+    """The set-up file is written with placeholders in capitals. One left in and switched on is
+    refused here, so that it is reported and never used as a server name, a key or a password."""
+    if value in words:
+        raise ValueError(f"{name} still holds the placeholder {value}: replace it with your own value, "
+                         "or switch that line off again")
+
+
 def search_config(settings: Optional[dict] = None) -> dict:
     """How search behaves unless a call says otherwise.
 
@@ -125,6 +133,8 @@ def storage_config(settings: Optional[dict] = None) -> dict:
         return {"kind": "sqlite", "path": str(path), "stemming": search_config(s)["stemming"]}
     if not (s["MONGO_URI"] or s["MONGO_HOST"]):
         raise ValueError("EXPERTISE_MINER_STORE=mongo needs MONGO_URI, or MONGO_HOST and its companions")
+    for name, words in (("MONGO_HOST", ("HOST",)), ("MONGO_USER", ("USER",)), ("MONGO_PASS", ("PASSWORD",))):
+        _not_placeholder(name, s[name], words)
     port = s["MONGO_PORT"] or "27017"
     if not port.isdigit():
         raise ValueError("MONGO_PORT must be a number")
@@ -185,6 +195,12 @@ def embed_config(settings: Optional[dict] = None) -> Optional[dict]:
         return None
     if not url or not model:
         raise ValueError("embeddings need both EXPERTISE_MINER_EMBED_URL and EXPERTISE_MINER_EMBED_MODEL")
+    _not_placeholder("EXPERTISE_MINER_EMBED_MODEL", model, ("MODEL_NAME",))
+    _not_placeholder("EXPERTISE_MINER_EMBED_KEY", key, ("TOKEN", "API_KEY", "KEY"))
+    for word in ("ACCOUNT_ID", "//HOST/", "//HOST:"):
+        if word in url + "/":
+            raise ValueError(f"EXPERTISE_MINER_EMBED_URL still holds the placeholder {word.strip('/:')}: replace it "
+                             "with your own value, or switch that line off again")
     if re.search(r"[\s\x00-\x1f\x7f\\]", url):
         raise ValueError("EXPERTISE_MINER_EMBED_URL must not hold spaces, control characters or backslashes")
     try:

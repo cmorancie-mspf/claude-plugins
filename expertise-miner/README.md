@@ -25,6 +25,7 @@ In any Claude Code chat:
 
 | Type | What happens |
 |---|---|
+| `/yt-setup` | Asks three questions (which database, which search, a proxy or not) and writes your settings file. Optional: with no settings everything works |
 | `/yt-pull @SomeChannel` | Agrees the size with you, then pulls the transcripts in the background |
 | `/yt-search "position sizing"` | Finds where it was said, with quotes and links that open the video at that moment |
 | `/mine-expertise @SomeChannel` | Reads the stored videos, checks every quote, clusters the items, writes the files |
@@ -87,7 +88,15 @@ The server looks for a working Python by trying `py -3` (Windows), `python3` and
 
 With no settings at all, transcripts go to a SQLite file and requests go out directly. That is the intended way to start.
 
-Settings are read from your environment, or from a file named `.env` in the data folder, which is `.expertise-miner` in your home folder. The environment wins. [`.env.example`](.env.example) lists every name; copy it there and fill in what you need. A `.env` in the project you happen to be working in is **not** read. (Claude Code's own project settings can still set environment variables for a session, as they can for any tool; that is outside this plugin.)
+Every setting answers one of three questions:
+
+1. **Which database holds the transcripts?** SQLite (the default), or your MongoDB.
+2. **How do you want to search?** By words (the default), or by words and by meaning through an embeddings endpoint you choose.
+3. **Do YouTube pulls go through a proxy?** No (the default), one proxy address, or a list.
+
+`/yt-setup` asks them and writes the settings file for your answers, with every setting in it under its question. It never asks for a secret and never writes one: passwords, keys, addresses and account ids go in as placeholders in capitals, on lines that are switched off. You replace them and switch those lines on yourself. So the file as first written changes nothing and sends nothing: its only active lines are the defaults, and it behaves like having no file. A placeholder left in on a line you switch on is reported as a mistake by `setup_check` and is not used. If a settings file already exists it is left alone. A change to the file takes effect at the next tool call; a pull or an embedding run that is already going keeps the settings it started with.
+
+Settings are read from your environment, or from a file named `.env` in the data folder, which is `.expertise-miner` in your home folder. The environment wins. [`.env.example`](.env.example) is that same file with the default answer to each question; you can copy it there and edit it by hand instead. A `.env` in the project you happen to be working in is **not** read. (Claude Code's own project settings can still set environment variables for a session, as they can for any tool; that is outside this plugin.)
 
 | Name | Does | Default |
 |---|---|---|
@@ -217,14 +226,15 @@ These limits are per pull and per data folder. Nothing stops someone from runnin
 
 | Tool | Does |
 |---|---|
-| `setup_check` | Reports Python, packages, storage, routes and the embeddings settings (never the key). Contacts nothing |
+| `setup_check` | Reports Python, packages, storage, routes, the embeddings settings (never the key), and the three choices in effect. Contacts nothing, except your own MongoDB server when that is the store |
+| `setup_write` | Writes the settings file from answers to the three questions, with placeholders where a secret goes. Never overwrites one |
 | `pull_channel`, `pull_playlist` | Start a pull in its own process and return a job id |
 | `pull_video` | Pulls one video and waits up to 45 seconds for it |
 | `pull_status` | Progress of a job, or the recent jobs |
 | `pull_resume` | Starts a stopped, blocked, failed or dead job again; skips what is stored |
 | `pull_stop` | Asks a running pull to stop after the request it is on |
 | `search_transcripts` | Ranked word and phrase search over passages, for one wording or several. Also by meaning where embeddings are set up |
-| `embed_status` | What is set for search by meaning, what is stored, and how much `embed_start` would send. Contacts nothing |
+| `embed_status` | What is set for search by meaning, what is stored, and how much `embed_start` would send. Contacts nothing: it reads the SQLite file |
 | `embed_start` | Sends the passages with no vector yet to your embeddings endpoint, in its own process, and returns a job id |
 | `embed_stop` | Asks a running embedding job to stop after the request it is on |
 | `get_transcript` | One transcript as timed lines, in parts |
