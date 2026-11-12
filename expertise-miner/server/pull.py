@@ -6,10 +6,12 @@ A pull runs as its own process so it outlives the tool call that started it:
     python pull.py wait <job_id>     blocks until the job ends; exit 0 done, 1 failed or
                                      stopped, 2 blocked, 3 the worker went quiet, 4 partial
 
-A job ends in one of these states: done; partial (the listing came back shorter than the
-count the site gives, even when listed again over another route: what was listed was
-pulled, and pull_resume lists again); blocked (every route was taken out); stopped; failed;
-and died, which is read from a record that stopped being updated.
+A job ends in one of these states: done; partial (the listing came back short of the count
+the site gives, even when listed again over another route. Short means: more than 5 entries
+and more than 5% of the count short, or short at all while ending on a whole number of pages
+(of 100 for a playlist, 30 for a channel tab). What was listed was pulled, and pull_resume
+lists again. A listing that holds max_videos videos is never short); blocked (every route
+was taken out); stopped; failed; and died, read from a record that stopped being updated.
 
 Listing uses yt-dlp; transcripts come from youtube-transcript-api. Both are imported only
 when a pull actually runs, so search over an existing corpus works without them.
@@ -45,6 +47,7 @@ PERMANENT = {"NoTranscriptFound", "TranscriptsDisabled", "VideoUnavailable", "Ag
 BLOCKED = {"RequestBlocked", "IpBlocked"}
 PROXY_REASONS = {"proxy_login": "ProxyLoginRefused", "proxy_unreachable": "ProxyUnreachable",
                  "proxy_setup": "ProxySupportMissing"}
+NOT_THE_SITE = set(PROXY_REASONS.values()) | {"ViewCountUnavailable"}    # not counted in refusals_by_route
 
 
 def pull_install_hint(package: str) -> str:
@@ -594,12 +597,16 @@ def _count(value) -> Optional[int]:
         return None
 
 
-def list_videos(job: dict, proxy: Optional[str]) -> list:
+def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) -> list:
     """The videos a job covers, newest first as YouTube lists them. No transcripts yet.
 
+    take() is called before each call to the site (one per playlist, per channel tab, or for the
+    one video): the pull's request limit. It may raise _Halted, which is passed on.
+
     Also sets job['listing']: site_count (the total the site gave, summed over the tabs when
-    every tab gave one, else None), short (a playlist or tab came back with fewer entries than
-    the site's own count: the cut_short test with a count), short_notes (the warnings that
+    every tab gave one, else None), short (a playlist or tab came back short of the site's own
+    count, by cut_short's measure: more than 5 entries and 5% short, or short and ending on a
+    whole page), short_notes (the warnings that
     said so), short_detail (what was short, for the end message) and errors (yt-dlp's own
     error lines during the listing, with credentials filtered out)."""
     cap = job["max_videos"]
@@ -612,6 +619,7 @@ def list_videos(job: dict, proxy: Optional[str]) -> list:
     listing: dict = {"site_count": None, "short": False, "short_notes": [], "short_detail": [], "errors": []}
     job["listing"] = listing
     if job["kind"] == "video":
+        take()
         with _ydl(proxy, {}, log) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={job['target']}", download=False)
         _note_warnings(job, log)
@@ -627,6 +635,7 @@ def list_videos(job: dict, proxy: Optional[str]) -> list:
     errors = 0
     counts: list = []
     for kind, url in urls:
+        take()                             # outside the try: a stop while waiting is not a failed tab
         try:
             with _ydl(proxy, flat, log) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -775,6 +784,8 @@ class RequestLimit:
         self.interval = 60.0 / self.per_minute if self.per_minute else 0.0
         self.clock, self.sleep = clock, sleep
         self.count = 0
+        self.first: Optional[float] = None     # the clock at the earliest and the latest turn given
+        self.last: Optional[float] = None
         self._next: Optional[float] = None
         self._lock = threading.Lock()
 
@@ -787,11 +798,29 @@ class RequestLimit:
                     if self.interval:
                         self._next = now + self.interval + 1e-6     # never closer, whatever the rounding
                     self.count += 1
+                    self.first = now if self.first is None else min(self.first, now)
+                    self.last = now if self.last is None else max(self.last, now)
                     return
                 wait = self._next - now
             if stopping():
                 raise _Halted()
             self.sleep(min(wait, self.LONGEST_NAP_S))
+
+
+def limit_in_force(job: dict) -> Optional[int]:
+    """The request limit a job runs with: None when the record holds none (no limit), else a whole
+    number from 1 to MAX_REQUESTS_PER_MINUTE. A record edited to something that is not a number, or
+    to anything under 1 (0, a fraction, a negative), gets the slowest pace, 1 a minute: never none."""
+    v = job.get("max_requests_per_minute")
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 1
+    if not f >= 1:                     # also NaN
+        return 1
+    return int(min(f, config.MAX_REQUESTS_PER_MINUTE))
 
 
 def jittered(delay_ms: int, rand: Callable = random.random) -> float:
@@ -833,18 +862,15 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
     lock = threading.Lock()
     stop_file = jobs_dir() / f"{job_id}.stop"
     done_evt = threading.Event()
-    try:
-        limit = int(job.get("max_requests_per_minute") or 0) or None
-    except (TypeError, ValueError):
-        limit = 1                          # a record edited into nonsense gets the slowest pace, not none
-    if limit is not None:
-        limit = max(1, min(limit, config.MAX_REQUESTS_PER_MINUTE))
+    limit = limit_in_force(job)
     rate = RequestLimit(limit, clock=clock, sleep=sleep)
 
     def save(**changes) -> None:
         with lock:
             job.update(changes)
             job["requests"] = rate.count
+            if rate.count >= 2 and rate.last > rate.first:      # from the first request to the latest
+                job["request_span_seconds"] = round(rate.last - rate.first, 3)
             job["heartbeat"] = time.time()
             write_job(job)
 
@@ -856,11 +882,11 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
         print(time.strftime("%H:%M:%S ") + config.scrub(msg, settings), flush=True)
 
     def listing_over(proxy: Optional[str]) -> tuple:
-        """One listing over `proxy`: (the videos, what list_videos recorded about it). yt-dlp's own
-        errors during the listing go to the log."""
+        """One listing over `proxy`: (the videos, what list_videos recorded about it). The lister takes a
+        turn of the request limit before each call it makes to the site (one per playlist or tab); a stop
+        request seen while it waits raises _Halted. yt-dlp's own errors during the listing go to the log."""
         job["listing"] = {}
-        rate.take()
-        got = lister(job, proxy)
+        got = lister(job, proxy, take=lambda: rate.take(stop_file.exists))
         info = dict(job.get("listing") or {})
         for err in info.get("errors") or []:
             log(f"listing over {config.mask_proxy(proxy)}: yt-dlp: {err}")
@@ -890,7 +916,7 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
         listed, info = listing_over(usable[0])
         first_notes = list(info.get("short_notes") or [])
         first_detail = list(info.get("short_detail") or [])
-        # A playlist or tab that came back with fewer entries than the site's own count is listed
+        # A playlist or tab that came back short of the site's own count (cut_short) is listed
         # once more, over the next route that is not cooling down (the route just used may have been
         # refused the next page). A short listing that still holds max_videos videos cost nothing.
         short = bool(info.get("short")) and not (cap and len(listed) >= cap)
@@ -901,25 +927,37 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
             cooling = cooling_routes()
             other = next((r for r in usable[1:] if config.mask_proxy(r) not in cooling), None)
             if other is None:
-                log("the listing was cut short, and there is no other route to list it again over")
+                log("the listing may have been cut short, and there is no other route to list it again over")
             else:
                 listed_over.append(config.mask_proxy(other))
-                log(f"the listing was cut short: listing it again over {listed_over[1]}")
+                log(f"the listing may have been cut short: listing it again over {listed_over[1]}")
                 try:
                     again, info2 = listing_over(other)
+                except _Halted:
+                    raise                  # stopped while waiting for its turn: nothing more is sent
                 except Exception as e:  # noqa: BLE001 - the first listing still stands
                     again, info2 = [], {}
                     log(f"listing again over {listed_over[1]} failed: {e if isinstance(e, PullError) else type(e).__name__ + ': ' + str(e)}")
-                longer, shorter = (again, listed) if len(again) >= len(listed) else (listed, again)
-                have = {v["video_id"] for v in longer}
-                listed = list(longer) + [v for v in shorter if v["video_id"] not in have]
-                short = (bool(info2.get("short")) or not info2) and not (cap and len(listed) >= cap)
-                info = {**info, **{k: v for k, v in info2.items() if v not in (None, [], "")}, "short": short}
+                first_len = len(listed)
+                have = {v["video_id"] for v in listed}
+                listed = list(listed) + [v for v in again if v["video_id"] not in have]
+                if len(again) > first_len:     # the longer listing's order: it holds the newest first
+                    have = {v["video_id"] for v in again}
+                    listed = list(again) + [v for v in listed if v["video_id"] not in have]
+                # Judged on everything listed, against the largest count either listing gave. Only a
+                # second listing longer than the first can show that the first was what was cut.
+                seen_counts = [c for c in (info.get("site_count"), info2.get("site_count")) if c is not None]
+                most = max(seen_counts) if seen_counts else None
+                page = 30 if job["kind"] == "channel" else 100
+                whole = len(again) > first_len and most is not None and not cut_short(len(listed), most, None, page)
+                short = not whole and not (cap and len(listed) >= cap)
+                info = {**info, "site_count": most, "short": short,
+                        "short_detail": [f"listed {len(listed)} of {most}"] if most is not None else first_detail}
                 log(f"listed again over {listed_over[1]}: {len(again)}; {len(listed)} in all"
-                    + ("" if short else ", so the listing is whole"))
+                    + ("" if short else ", so the listing is taken as whole"))
                 if not short:              # the first listing's cut-short warnings no longer hold
                     job["warnings"] = [w for w in job.get("warnings") or [] if w not in first_notes]
-                    job["warnings"].append(f"the first listing, over {listed_over[0]}, was cut short ("
+                    job["warnings"].append(f"the first listing, over {listed_over[0]}, looked cut short ("
                                            + "; ".join(first_detail)
                                            + f"); listed again over {listed_over[1]}: {len(listed)} in all")
         for w in job.get("warnings") or []:
@@ -965,11 +1003,14 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
             log(f"over {key[0]}: {reason}: {detail}"[:400])
 
         def let_off(proxy: Optional[str], run: list) -> None:
-            """A run of refusals that ended without taking its route out is counted against the route."""
-            if run:
+            """A run of videos with no answer that ended without taking its route out is counted against
+            the route. Only the site's own silence counts: not the proxy failing, not an unreadable page
+            under min_views, not an error of this code or the store."""
+            k = sum(1 for _, site_said_nothing in run if site_said_nothing)
+            if k:
                 masked = config.mask_proxy(proxy)
                 with lock:
-                    refusals[masked] = refusals.get(masked, 0) + len(run)
+                    refusals[masked] = refusals.get(masked, 0) + k
 
         def one(v: dict, proxy: Optional[str], last_reason: list) -> str:
             """Handle one video. Returns 'skipped' (nothing was sent), 'answered' (the site gave the
@@ -1068,12 +1109,13 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                     if not queue:
                         return
                     v = queue.pop(0)
+                ours = False                # the failure was this code's or the store's, not the site's
                 try:
                     outcome = one(v, w["proxy"], last_reason)
                 except _Halted:
                     continue                # waiting for its turn when the pull began to end: the loop's top says why
                 except Exception as e:  # noqa: BLE001 - one video must not end the job
-                    outcome = "refused"
+                    outcome, ours = "refused", True
                     last_reason[0] = type(e).__name__
                     bump("failed", type(e).__name__)
                     log(f"{v['video_id']}: {type(e).__name__}: {e}")
@@ -1082,10 +1124,11 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                     let_off(w["proxy"], w["run"])
                     w["run"] = []
                 elif outcome == "refused":
-                    w["run"].append(last_reason[0] or "Unknown")
+                    why = last_reason[0] or "Unknown"
+                    w["run"].append((why, not ours and why not in NOT_THE_SITE))
                     if len(w["run"]) >= BLOCK_STREAK:
                         run, w["run"] = w["run"], []        # this run takes the route out: not counted again
-                        nxt = take_out(w["proxy"], run)
+                        nxt = take_out(w["proxy"], [r for r, _ in run])
                         if nxt is None:
                             with lock:
                                 if not halt["state"]:
@@ -1111,7 +1154,8 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
         for t in threads:
             t.join()
         c = job["counts"]
-        warn = "".join(f". Warning: {r} refused {k} request{'s' if k != 1 else ''} that did not take it out"
+        warn = "".join(f". Warning: over {'your own address' if r == 'direct' else r}, {k} video{'s' if k != 1 else ''} "
+                       f"got no answer from the site without the route being taken out"
                        for r, k in sorted(refusals.items()) if k)
         if halt["state"]:
             save(state=halt["state"], message=halt["message"] + warn, ended=time.time())
@@ -1137,11 +1181,14 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                 over = (f", over {listed_over[0]} and again over {listed_over[1]}" if len(listed_over) > 1 else
                         f" over {listed_over[0]}, and there was no other route to list it again over")
                 save(state="partial", ended=time.time(),
-                     message=(f"{cut}: the listing was cut short{over}. The videos listed were pulled: {msg}. "
+                     message=(f"{cut}: the listing may have been cut short{over}. The videos listed were pulled: {msg}. "
                               "pull_resume tries the listing again" + warn))
             else:
                 save(state="done", ended=time.time(), message=msg + warn)
         log(f"{job['state']}: {job['message']}")
+    except _Halted:
+        save(state="stopped", message="stopped on request, while the listing waited for its turn", ended=time.time())
+        log(f"stopped: {job['message']}")
     except PullError as e:
         save(state="failed", message=config.scrub(str(e), settings), ended=time.time())
         log(f"failed: {e}")
@@ -1160,7 +1207,9 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
     return job
 
 
-EXIT_CODES = {"done": 0, "blocked": 2, "died": 3, "partial": 4}     # anything else (failed, stopped): 1
+# How a job ended, as an exit code: `wait` returns these, and so does the worker process (`run`), whose
+# own exit code nobody reads but is kept the same. Anything else (failed, stopped): 1.
+EXIT_CODES = {"done": 0, "blocked": 2, "died": 3, "partial": 4}
 
 
 def wait(job_id: str, poll_s: float = 3.0) -> int:
@@ -1175,7 +1224,7 @@ def wait(job_id: str, poll_s: float = 3.0) -> int:
 
 def main(argv: list) -> int:
     if len(argv) == 3 and argv[1] == "run":
-        return 0 if run_job(argv[2]).get("state") == "done" else 1
+        return EXIT_CODES.get(run_job(argv[2]).get("state"), 1)
     if len(argv) == 3 and argv[1] == "wait":
         try:
             return wait(argv[2])
