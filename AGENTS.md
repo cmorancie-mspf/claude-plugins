@@ -43,7 +43,7 @@ python expertise-miner/tests/test_miner.py
 
 - `check.mjs` verifies the manifests, the skill and agent front matter, that every `${CLAUDE_PLUGIN_ROOT}` path exists, that every script parses, and that no machine path or secret-shaped string is committed. CI runs it and compiles the Python scripts.
 - `test_factory.mjs` uses a stand-in for OpenCode, calls no model and spends nothing. A few of its checks need git and OpenCode 2 installed.
-- `test_miner.py` uses the standard library only (`python3` where `python` is not on the path). Listing and transcript fetching are replaced by stand-ins: it contacts nothing and needs no package installed. Never make a test of `expertise-miner` send a real request.
+- `test_miner.py` uses the standard library only (`python3` where `python` is not on the path). Listing, transcript fetching and the embeddings endpoint are replaced by stand-ins: it contacts nothing and needs no package installed. Never make a test of `expertise-miner` send a real request.
 - `transcribe` has no committed tests. If you change `transcribe.py`, test it with a stand-in for the speech model; do not load a model in an automated check.
 
 ## Rules that must not be broken
@@ -54,7 +54,7 @@ python expertise-miner/tests/test_miner.py
 4. **A plugin is published only after an independent review has approved it.** A reviewer that did not write the change reads the files, tries to break them, and says approve. Fix, and have the same reviewer check again, until it does. Do not add a plugin to `marketplace.json` before that.
 5. **One plugin per commit and per push** when publishing, so that each can be traced to its review.
 6. **Do not run a real builder, spend money or load a large model in a test.** Use a stub.
-7. **Never weaken the quote check or the politeness limits of `expertise-miner`.** An item reaches the output only when its quote is found in the stored transcript; workers never exceed distinct routes; the delay has a floor; a run of refusals stops the pull; only YouTube addresses built from a parsed id reach the downloader; configured credentials are filtered from every log line, job record and tool result the code writes; `mine_build` never believes `verified.jsonl` without checking it again. A change that adds a way round any of these is a defect.
+7. **Never weaken the quote check or the politeness limits of `expertise-miner`.** An item reaches the output only when its quote is found in the stored transcript; workers never exceed distinct routes; the delay has a floor; a run of refusals stops the pull; only YouTube addresses built from a parsed id reach the downloader; configured credentials are filtered from every log line, job record and tool result the code writes; `mine_build` never believes `verified.jsonl` without checking it again. The embeddings address comes from the owner's settings only, never from a tool call or stored text; nothing is sent to it unless it is set; redirects from it are not followed; vectors made by two models are never mixed. A change that adds a way round any of these is a defect.
 8. **Bump the plugin's `version`** in its `plugin.json` when its behaviour changes.
 
 ## Adding a plugin

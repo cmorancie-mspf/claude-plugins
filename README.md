@@ -75,7 +75,8 @@ For finding out how an expert actually works, from what they have said on YouTub
 > - It makes automated requests to YouTube from your address, slowly on purpose. YouTube may still refuse an address that asks for a lot; the pull then stops itself.
 > - Whether collecting and studying a channel's transcripts is acceptable for your purpose is your decision.
 > - Mined items report what was said. Nothing checks whether it is true.
-> - **Status: new.** Tried on Windows, on a handful of videos, with SQLite and no proxy.
+> - **Status: new.** Tried on Windows, on a handful of videos, with SQLite and no proxy. Search by meaning has been tested against a stand-in endpoint only.
+> - Search by meaning is optional and off by default. If you turn it on with a hosted embeddings endpoint, the text of your stored transcripts and the wording of your searches are sent to that endpoint.
 
 | Type | What happens |
 |---|---|
@@ -83,7 +84,7 @@ For finding out how an expert actually works, from what they have said on YouTub
 | `/yt-search "some phrase"` | Finds the passages where it was said, ranked, with quotes and links to the moment |
 | `/mine-expertise @SomeChannel` | One reader per video writes items; a tool rejects every item whose quote is not in the transcript; the rest are clustered into a question bank |
 
-Requires Node 18 or later and Python 3.9 or later. Pulling needs two Python packages, installed on first use only when you agree. Storage is a local SQLite file; MongoDB and a proxy are optional settings. See [its README](expertise-miner/README.md).
+Requires Node 18 or later and Python 3.9 or later. Pulling needs two Python packages, installed on first use only when you agree. Storage is a local SQLite file; MongoDB, a proxy, and search by meaning through an embeddings endpoint you choose are optional settings. See [its README](expertise-miner/README.md).
 
 ## Layout of this repository
 

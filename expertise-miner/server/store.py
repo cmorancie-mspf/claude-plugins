@@ -3,13 +3,20 @@
 One record per video, keyed on video_id. A record holds the transcript twice: as one text
 (`transcript`, for search) and as timed lines (`segments`, a list of [start_seconds, text]),
 which is what lets a quote be traced to a moment in the video.
+
+The SQLite store can also hold one embedding vector per passage (optional, see embed.py).
+Every vector row names the model that made it, and the store refuses a second model.
 """
 from __future__ import annotations
 
 import bisect
+import hashlib
+import heapq
 import json
+import math
 import re
 import sqlite3
+import struct
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -181,6 +188,80 @@ def fuse(rankings: list, k: int = 60) -> list:
     return sorted(score, key=lambda key: (-score[key], key))
 
 
+# ---------- embedding vectors (optional) -----------------------------------------
+
+EMBED_CHARS = 2000          # at most this much of a passage is sent to be embedded; passages are about 400
+PURE_PYTHON_VECTORS = 2000  # without numpy, vector ranking is refused past this many stored vectors
+MAX_DIM = 8192
+_SCAN_ROWS = 2048           # vectors read from disk at a time during a search, with numpy
+_SCAN_ROWS_PLAIN = 128      # and without it, where a vector unpacked into Python numbers is many times larger
+
+
+class VectorError(Exception):
+    """A refusal to store or use vectors, with a message meant for the person."""
+
+
+def embed_text(text: str) -> str:
+    """The part of a passage that is embedded."""
+    return " ".join(str(text).split())[:EMBED_CHARS]
+
+
+def text_hash(text: str) -> str:
+    """Ties a vector to the exact text it was made from. A passage whose text has changed since
+    (the video was pulled again, or the index was rebuilt by another version) no longer matches,
+    and its vector is not used."""
+    return hashlib.sha1(embed_text(text).encode("utf-8")).hexdigest()[:20]
+
+
+def unit_vector(values) -> list:
+    """The numbers of one embedding, checked and scaled to length 1. Raises VectorError."""
+    if not isinstance(values, (list, tuple)) or not (1 <= len(values) <= MAX_DIM):
+        raise VectorError("an embedding was not a list of numbers")
+    out = []
+    try:
+        for v in values:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise VectorError("an embedding held something that is not a finite number")
+            out.append(float(v))
+        length = math.sqrt(math.fsum(v * v for v in out))
+    except (OverflowError, ValueError):            # a whole number too large to be a float
+        raise VectorError("an embedding held a number too large to use") from None
+    if not math.isfinite(length) or length < 1e-12:
+        raise VectorError("an embedding was all zeros")
+    return [v / length for v in out]
+
+
+def pack_vector(unit: list) -> bytes:
+    return struct.pack(f"<{len(unit)}f", *unit)
+
+
+def _numpy():
+    """numpy when it is installed, else None. Tests replace this to exercise both paths."""
+    try:
+        import numpy
+        return numpy
+    except Exception:  # noqa: BLE001 - a broken install counts as absent
+        return None
+
+
+def _scores(blobs: list, queries: list, dim: int, np) -> list:
+    """Dot products of each stored vector with each query: one list of floats per query.
+    Everything is unit length, so this is the cosine similarity."""
+    if np is not None:
+        m = np.frombuffer(b"".join(blobs), dtype="<f4").reshape(len(blobs), dim)
+        s = np.nan_to_num(m @ np.asarray(queries, dtype="<f4").T, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        return [s[:, i].tolist() for i in range(len(queries))]
+    rows = [struct.unpack(f"<{dim}f", b) for b in blobs]
+    out = []
+    for q in queries:
+        col = []
+        for r in rows:
+            v = math.fsum(map(float.__mul__, q, r))
+            col.append(v if math.isfinite(v) else -1.0)
+        out.append(col)
+    return out
+
+
 def clean_doc(doc: dict) -> dict:
     """A record in the one shape every caller sees, whatever wrote it."""
     segs = doc.get("segments") or []
@@ -233,6 +314,17 @@ CREATE TABLE IF NOT EXISTS passages (
   UNIQUE (video_id, idx)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS vectors (
+  passage_id INTEGER PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL,
+  text_hash TEXT NOT NULL, vec BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS vectors_kept (
+  video_id TEXT NOT NULL, text_hash TEXT NOT NULL, model TEXT NOT NULL, dim INTEGER NOT NULL,
+  vec BLOB NOT NULL, PRIMARY KEY (video_id, text_hash)
+);
+CREATE TABLE IF NOT EXISTS embed_refused (
+  passage_id INTEGER PRIMARY KEY, model TEXT NOT NULL, text_hash TEXT NOT NULL
+);
 """
 INDEX_VERSION = "2"
 
@@ -291,6 +383,13 @@ class SqliteStore:
                 if self._marker() != want:
                     self._drop("videos_fts")                     # the 0.1 whole-video index
                     self._drop("passages_fts")
+                    # Passage ids are about to change. Vectors are set aside by video and text, and
+                    # go back to the passages with the same text as each video is indexed again.
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO vectors_kept (video_id, text_hash, model, dim, vec) "
+                        "SELECT p.video_id, x.text_hash, x.model, x.dim, x.vec FROM vectors x "
+                        "JOIN passages p ON p.id = x.passage_id")
+                    self._db.execute("DELETE FROM vectors")
                     self._db.execute("DELETE FROM passages")
                     if self.fts:
                         self._create_fts()
@@ -328,14 +427,31 @@ class SqliteStore:
 
     def _index(self, d: dict) -> None:
         # A passage's row in the full-text table has the passage's own id, so both are reached directly.
+        vid = d["video_id"]
+        # A passage's vector must never outlive the passage: ids are reused. The video's vectors are
+        # taken out here and given back only to new passages whose text is exactly what was embedded.
+        kept = {r[0]: (r[1], r[2], r[3]) for r in self._db.execute(
+            "SELECT text_hash, model, dim, vec FROM vectors_kept WHERE video_id = ?", (vid,))}
+        kept.update({r[0]: (r[1], r[2], r[3]) for r in self._db.execute(
+            "SELECT x.text_hash, x.model, x.dim, x.vec FROM vectors x JOIN passages p ON p.id = x.passage_id "
+            "WHERE p.video_id = ?", (vid,))})
+        self._db.execute("DELETE FROM vectors WHERE passage_id IN (SELECT id FROM passages WHERE video_id = ?)", (vid,))
+        self._db.execute("DELETE FROM vectors_kept WHERE video_id = ?", (vid,))
         if self.fts:
             self._db.execute("DELETE FROM passages_fts WHERE rowid IN (SELECT id FROM passages WHERE video_id = ?)",
-                             (d["video_id"],))
-        self._db.execute("DELETE FROM passages WHERE video_id = ?", (d["video_id"],))
+                             (vid,))
+        self._db.execute("DELETE FROM passages WHERE video_id = ?", (vid,))
         for idx, start, text, joint in make_passages(d):
             pid = self._db.execute(
                 "INSERT INTO passages (video_id, idx, start, text, joint) VALUES (?, ?, ?, ?, ?)",
                 (d["video_id"], idx, start, text, joint)).lastrowid
+            # An id can be handed out again after a process of an older version removed passages
+            # without their vectors, so whatever vector sits on this id is not this passage's.
+            self._db.execute("DELETE FROM vectors WHERE passage_id = ?", (pid,))
+            old = kept.get(text_hash(text)) if kept else None
+            if old:
+                self._db.execute("INSERT OR REPLACE INTO vectors (passage_id, model, dim, text_hash, vec) "
+                                 "VALUES (?, ?, ?, ?, ?)", (pid, old[0], old[1], text_hash(text), old[2]))
             if self.fts:                   # the title is searched as part of the video's first passage only
                 self._db.execute(
                     "INSERT OR REPLACE INTO passages_fts (rowid, video_id, idx, title, body, joint) VALUES (?, ?, ?, ?, ?, ?)",
@@ -484,6 +600,204 @@ class SqliteStore:
                 f"SELECT video_id, title, channel, upload_date, view_count FROM videos "
                 f"WHERE video_id IN ({marks})", list(video_ids)).fetchall()
         return {r["video_id"]: dict(r) for r in rows}
+
+    # ----- embedding vectors -----
+
+    def _embed_marker(self) -> Optional[dict]:
+        r = self._db.execute("SELECT value FROM meta WHERE key = 'embed'").fetchone()
+        try:
+            m = json.loads(r[0]) if r else None
+            return {"model": str(m["model"]), "dim": int(m["dim"])} if m else None
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def vector_info(self) -> dict:
+        """Which model the stored vectors were made by, and how many there are. The count is of
+        rows: one whose passage text was changed since by a process that knew nothing of vectors
+        is still counted here, is not used, and is owed again (count_pending is exact)."""
+        with self._lock:
+            m = self._embed_marker()
+            total = self._db.execute("SELECT COUNT(*) FROM passages").fetchone()[0]
+            n = 0
+            if m:
+                n = self._db.execute(
+                    "SELECT COUNT(*) FROM vectors x JOIN passages p ON p.id = x.passage_id "
+                    "WHERE x.model = ? AND x.dim = ?", (m["model"], m["dim"])).fetchone()[0]
+        return {"model": m["model"] if m else "", "dim": m["dim"] if m else 0, "vectors": n, "passages": total}
+
+    def pending_passages(self, model: str, after_id: int = 0, limit: int = 32, scan: int = 500,
+                         _refused: Optional[list] = None) -> tuple:
+        """Passages with no usable vector by this model, in id order from after_id on:
+        ([(id, text_to_embed)], last_id_looked_at, reached_the_end). A passage the endpoint
+        refused when it was sent alone is left out for as long as its text stays the same."""
+        out: list = []
+        last = int(after_id)
+        with self._lock:
+            while len(out) < limit:
+                rows = self._db.execute(
+                    "SELECT p.id, p.text, x.text_hash, r.text_hash FROM passages p "
+                    "LEFT JOIN vectors x ON x.passage_id = p.id AND x.model = ? "
+                    "LEFT JOIN embed_refused r ON r.passage_id = p.id AND r.model = ? "
+                    "WHERE p.id > ? ORDER BY p.id LIMIT ?", (model, model, last, int(scan))).fetchall()
+                if not rows:
+                    return out, last, True
+                if after_id == 0 and last == 0:        # a fresh pass: drop records of passages that are gone
+                    self._db.execute("DELETE FROM embed_refused WHERE passage_id NOT IN (SELECT id FROM passages)")
+                    self._db.commit()
+                for pid, text, have, refused in rows:
+                    last = pid
+                    body = embed_text(text)
+                    if not body:
+                        continue
+                    h = text_hash(text)
+                    if have == h:
+                        continue
+                    if refused == h:
+                        if _refused is not None:
+                            _refused.append(pid)
+                        continue
+                    out.append((pid, body))
+                    if len(out) >= limit:
+                        break
+        return out, last, False
+
+    def count_pending(self, model: str) -> dict:
+        """How much an embedding run would send: passages and characters. `refused` counts the
+        passages the endpoint would not take when sent alone, which a run leaves out."""
+        n = chars = last = 0
+        refused: list = []
+        while True:
+            got, last, end = self.pending_passages(model, last, limit=2000, scan=2000, _refused=refused)
+            n += len(got)
+            chars += sum(len(t) for _, t in got)
+            if end:
+                return {"passages": n, "characters": chars, "refused": len(refused)}
+
+    def record_refused(self, model: str, passage_id: int, body: str) -> None:
+        """Remember that the endpoint would not embed this passage, so that later runs go past it."""
+        with self._lock:
+            r = self._db.execute("SELECT text FROM passages WHERE id = ?", (passage_id,)).fetchone()
+            if r is not None and embed_text(r[0]) == body:
+                self._db.execute("INSERT OR REPLACE INTO embed_refused (passage_id, model, text_hash) VALUES (?, ?, ?)",
+                                 (passage_id, model, text_hash(r[0])))
+                self._db.commit()
+
+    def forget_refused(self, passage_ids: list) -> None:
+        with self._lock:
+            self._db.executemany("DELETE FROM embed_refused WHERE passage_id = ?", [(int(i),) for i in passage_ids])
+            self._db.commit()
+
+    def clear_refused(self) -> int:
+        with self._lock:
+            n = self._db.execute("SELECT COUNT(*) FROM embed_refused").fetchone()[0]
+            self._db.execute("DELETE FROM embed_refused")
+            self._db.commit()
+        return n
+
+    def store_vectors(self, model: str, dim: int, rows: list) -> int:
+        """Store [(passage_id, text_embedded, unit_vector)]. One model per corpus: the first vector
+        stored fixes the model and the vector size, and anything else is refused until
+        clear_vectors. A vector is stored only if its passage still holds the text that was sent."""
+        dim = int(dim)
+        with self._lock:
+            self._db.commit()
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                m = self._embed_marker()
+                if m and (m["model"] != model or m["dim"] != dim):
+                    raise VectorError(
+                        f"this corpus holds vectors made by {m['model']} ({m['dim']} numbers each); vectors by "
+                        f"{model} ({dim}) cannot be mixed with them. Start the embedding again with reembed to "
+                        "change model: that removes the stored vectors first.")
+                if not m:
+                    if self._db.execute("SELECT 1 FROM vectors LIMIT 1").fetchone() or \
+                            self._db.execute("SELECT 1 FROM vectors_kept LIMIT 1").fetchone():
+                        raise VectorError("this corpus holds vectors with no record of the model that made them. "
+                                          "Start the embedding again with reembed.")
+                    self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('embed', ?)",
+                                     (json.dumps({"model": model, "dim": dim}),))
+                stored = 0
+                for pid, body, unit in rows:
+                    if len(unit) != dim:
+                        raise VectorError("the endpoint returned vectors of different sizes")
+                    r = self._db.execute("SELECT text FROM passages WHERE id = ?", (pid,)).fetchone()
+                    if r is None or embed_text(r[0]) != body:
+                        continue               # the passage changed while its text was away
+                    self._db.execute("INSERT OR REPLACE INTO vectors (passage_id, model, dim, text_hash, vec) "
+                                     "VALUES (?, ?, ?, ?, ?)", (pid, model, dim, text_hash(r[0]), pack_vector(unit)))
+                    stored += 1
+                self._db.commit()
+                return stored
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def clear_vectors(self) -> int:
+        """Forget every vector and the model they were made by. Returns how many were removed."""
+        with self._lock:
+            self._db.commit()
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                n = self._db.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
+                self._db.execute("DELETE FROM vectors")
+                self._db.execute("DELETE FROM vectors_kept")
+                self._db.execute("DELETE FROM embed_refused")
+                self._db.execute("DELETE FROM meta WHERE key = 'embed'")
+                self._db.commit()
+                return n
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def search_vectors(self, queries: list, model: str, channel: Optional[str] = None, limit: int = 60) -> list:
+        """For each query (a unit vector), the passages whose vectors lie closest, best first:
+        one list of [{video_id, idx, seconds, text, score}] per query. Only vectors made by `model`
+        are read, and a vector whose passage text has changed since is left out. Vectors are read
+        from disk a block at a time, so memory does not grow with the corpus. Without numpy the
+        blocks are small, the corpus is limited, and a search is slow: seconds near the limit."""
+        if not queries:
+            return []
+        np = _numpy()
+        where, args = self._where_channel(channel, "v.")
+        with self._lock:
+            m = self._embed_marker()
+            if not m or m["model"] != model:
+                raise VectorError("the stored vectors were not made by the configured model")
+            dim = m["dim"]
+            if any(len(q) != dim for q in queries):
+                raise VectorError(f"the endpoint now returns vectors of a different size than the {dim} stored")
+            if np is None:
+                n = self._db.execute("SELECT COUNT(*) FROM vectors WHERE model = ? AND dim = ?", (model, dim)).fetchone()[0]
+                if n > PURE_PYTHON_VECTORS:
+                    raise VectorError(f"ranking {n} vectors needs the numpy package (without it the limit is "
+                                      f"{PURE_PYTHON_VECTORS})")
+            cur = self._db.execute(
+                "SELECT x.passage_id, x.vec FROM vectors x JOIN passages p ON p.id = x.passage_id "
+                f"JOIN videos v ON v.video_id = p.video_id WHERE x.model = ? AND x.dim = ?{where}",
+                [model, dim] + args)
+            tops: list = [[] for _ in queries]
+            while True:
+                chunk = cur.fetchmany(_SCAN_ROWS if np is not None else _SCAN_ROWS_PLAIN)
+                if not chunk:
+                    break
+                good = [(r[0], r[1]) for r in chunk if isinstance(r[1], bytes) and len(r[1]) == dim * 4]
+                if not good:
+                    continue
+                scores = _scores([b for _, b in good], queries, dim, np)
+                for qi, col in enumerate(scores):
+                    tops[qi] = heapq.nsmallest(int(limit), tops[qi] + [(-s, pid) for s, (pid, _) in zip(col, good)])
+            out = []
+            for top in tops:
+                hits = []
+                for neg, pid in top:
+                    r = self._db.execute(
+                        "SELECT p.video_id, p.idx, p.start, p.text, x.text_hash FROM passages p "
+                        "JOIN vectors x ON x.passage_id = p.id WHERE p.id = ?", (pid,)).fetchone()
+                    if r is None or r[4] != text_hash(r[3]):
+                        continue               # the passage was replaced after its vector was made
+                    hits.append({"video_id": r[0], "idx": r[1], "seconds": r[2], "text": r[3], "score": round(-neg, 4)})
+                out.append(hits)
+        return out
 
     def stats(self) -> dict:
         with self._lock:

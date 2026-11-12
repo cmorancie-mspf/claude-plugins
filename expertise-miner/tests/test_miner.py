@@ -2,14 +2,17 @@
 
     python tests/test_miner.py
 
-Listing and transcript fetching are replaced by stand-ins, and every test works in its own
-temporary data folder.
+Listing, transcript fetching and the embeddings endpoint are replaced by stand-ins, and every
+test works in its own temporary data folder. No test opens a connection.
 """
 from __future__ import annotations
 
+import email.message
+import io
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "server"))
 
 import config  # noqa: E402
+import embed  # noqa: E402
 import mine  # noqa: E402
 import pull  # noqa: E402
 import store as store_mod  # noqa: E402
@@ -814,6 +818,780 @@ class MineTests(Base):
                 mine.verify(bad, self.st)
 
 
+# ---------- embeddings: every endpoint here is a stand-in ---------------------------
+
+CONCEPTS = {"money": 0, "bankroll": 0, "cash": 0, "stake": 0, "minutes": 1, "played": 1, "role": 1,
+            "opponent": 2, "defense": 2, "rain": 3, "weather": 3}
+SECRET = "sk-test-SECRETKEY123"
+EMBED_URL = "https://embed.example/client/v4/accounts/acct999/ai/v1"
+MONEY = ["how much cash i put in play each night", "the opponent and their defense matter most",
+         "rain and weather change everything outdoors", "nothing of note is said here at all"]
+
+
+def fake_vector(text):
+    """A stand-in for a model: texts about the same thing get the same direction."""
+    v = [0.0] * 6
+    for w in store_mod.norm(text).split():
+        if w in CONCEPTS:
+            v[CONCEPTS[w]] += 1.0
+    if not any(v):
+        v[5] = 1.0
+    return v
+
+
+class FakeEndpoint:
+    """Stands where embed.post_embeddings would: records what it was sent, answers from fake_vector."""
+
+    def __init__(self, script=None):
+        self.calls, self.script = [], list(script or [])
+
+    def __call__(self, cfg, texts, timeout=0, opener=None):
+        self.calls.append(list(texts))
+        self.cfg = cfg
+        if self.script:
+            step = self.script.pop(0)
+            if isinstance(step, Exception):
+                raise step
+            if callable(step):
+                return step(texts)
+        return [store_mod.unit_vector(fake_vector(t)) for t in texts]
+
+
+class FakeOpener:
+    """Stands where urllib's opener would. Answers with canned bytes or raises what it was given."""
+
+    def __init__(self, answer, pieces=None):
+        self.answer, self.requests, self.pieces = answer, [], pieces
+
+    def open(self, req, timeout=None):
+        self.requests.append(req)
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        self.left = list(self.pieces) if self.pieces is not None else [self.answer]
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n=-1):
+        return self.left.pop(0) if self.left else b""
+
+
+def http_error(code, body=b"", retry_after=None):
+    hdrs = email.message.Message()
+    if retry_after is not None:
+        hdrs["Retry-After"] = str(retry_after)
+    return embed.urllib.error.HTTPError(EMBED_URL, code, "x", hdrs, io.BytesIO(body))
+
+
+class EmbedBase(Base):
+    def configure(self, model="model-a", url=EMBED_URL, key=SECRET, **more):
+        os.environ.update({"EXPERTISE_MINER_EMBED_URL": url, "EXPERTISE_MINER_EMBED_MODEL": model, **more})
+        os.environ.pop("EXPERTISE_MINER_EMBED_KEY", None)
+        if key:
+            os.environ["EXPERTISE_MINER_EMBED_KEY"] = key
+
+    def corpus(self, st=None):
+        st = st or self.open()
+        st.upsert_video(self.video(VID_A, segments=[[i * 40.0, t] for i, t in enumerate(MONEY)]))
+        st.upsert_video(self.video(VID_B, channel="Other Voice", channel_handle="@other",
+                                   segments=[[0.0, "my bankroll and my stake"], [40.0, "minutes played in a new role"]]))
+        return st
+
+    def job(self, **spec):
+        job = embed.build_job(spec)
+        pull.write_job(job)
+        return job["id"]
+
+    def run_embed(self, st, endpoint=None, **spec):
+        self.sleeps = []
+        endpoint = endpoint or FakeEndpoint()
+        jid = self.job(**spec)
+        return embed.run_job(jid, sender=endpoint, sleep=self.sleeps.append, store=st), endpoint, jid
+
+
+class EmbedConfigTests(EmbedBase):
+    def test_embeddings_are_off_until_an_address_and_a_model_are_both_set(self):
+        self.assertIsNone(config.embed_config())
+        os.environ["EXPERTISE_MINER_EMBED_URL"] = EMBED_URL
+        with self.assertRaises(ValueError):
+            config.embed_config()                                   # no model, and none is assumed
+        os.environ["EXPERTISE_MINER_EMBED_MODEL"] = "@cf/baai/bge-m3"
+        cfg = config.embed_config()
+        self.assertEqual(cfg["url"], EMBED_URL + "/embeddings")
+        self.assertEqual((cfg["host"], cfg["model"], cfg["key"], cfg["batch"], cfg["local"]),
+                         ("embed.example", "@cf/baai/bge-m3", "", 32, False))
+        os.environ["EXPERTISE_MINER_EMBED_URL"] = "https://api.example/v1/embeddings/"
+        self.assertEqual(config.embed_config()["url"], "https://api.example/v1/embeddings")
+        del os.environ["EXPERTISE_MINER_EMBED_URL"], os.environ["EXPERTISE_MINER_EMBED_MODEL"]
+        os.environ["EXPERTISE_MINER_EMBED_KEY"] = SECRET
+        with self.assertRaises(ValueError):
+            config.embed_config()                                   # a key with nowhere to send it is a mistake
+
+    def test_plain_http_is_for_this_machine_only_and_odd_addresses_are_refused(self):
+        for url in ("http://localhost:11434/v1", "http://127.0.0.1:11434/v1", "http://[::1]:11434/v1"):
+            self.configure(url=url, key="")
+            self.assertTrue(config.embed_config()["local"], url)
+        self.assertEqual(config.embed_config()["url"], "http://[::1]:11434/v1/embeddings")
+        for url in ("http://embed.example/v1", "http://localhost.evil.example/v1", "http://127.0.0.1.example/v1",
+                    "https://user:pw@embed.example/v1", "https://key@embed.example/v1", "ftp://embed.example/v1",
+                    "file:///etc/passwd", "https://embed.example/v1?key=1", "https://embed.example/v1#x",
+                    "https://embed.example/v 1", "https://embed.example\\@evil.example/v1", "embed.example/v1",
+                    "https:///v1"):
+            self.configure(url=url)
+            with self.assertRaises(ValueError, msg=url):
+                config.embed_config()
+        for model in ("two words", "m\nX-Injected: 1", "a|b", ""):
+            self.configure(model=model)
+            with self.assertRaises(ValueError, msg=model):
+                config.embed_config()
+        for key in ("has space", "line\nbreak"):
+            self.configure(key=key)
+            with self.assertRaises(ValueError, msg=key):
+                config.embed_config()
+        self.configure(EXPERTISE_MINER_EMBED_BATCH="0")
+        with self.assertRaises(ValueError):
+            config.embed_config()
+
+    def test_the_key_and_the_address_never_survive_scrub_or_reach_a_job_record(self):
+        self.configure()
+        text = config.scrub(f"failed: Authorization: Bearer {SECRET} at {EMBED_URL}/embeddings; "
+                            "also Bearer other-token-456 and bearer  third.token")
+        for secret in (SECRET, "acct999", "other-token-456", "third.token"):
+            self.assertNotIn(secret, text)
+        described = config.describe_embed(config.embed_config())
+        self.assertEqual(described, "model model-a at embed.example")
+        record = json.dumps(embed.build_job({}))
+        for secret in (SECRET, "acct999"):
+            self.assertNotIn(secret, record)
+
+    def test_one_request_is_shaped_as_the_endpoint_expects_and_its_answer_is_checked(self):
+        self.configure()
+        cfg = config.embed_config()
+        answer = {"object": "list", "data": [{"index": 1, "embedding": [0, 3, 4]}, {"index": 0, "embedding": [2, 0, 0]}]}
+        op = FakeOpener(json.dumps(answer).encode())
+        got = embed.post_embeddings(cfg, ["first", "second"], opener=op)
+        self.assertEqual(got, [[1.0, 0.0, 0.0], [0.0, 0.6, 0.8]])          # in the order sent, length 1
+        req = op.requests[0]
+        self.assertEqual((req.full_url, req.get_method()), (EMBED_URL + "/embeddings", "POST"))
+        self.assertEqual(req.get_header("Authorization"), "Bearer " + SECRET)
+        self.assertEqual(json.loads(req.data), {"model": "model-a", "input": ["first", "second"]})
+        self.configure(url="http://localhost:11434/v1", key="")
+        op = FakeOpener(json.dumps({"data": [{"embedding": [1, 0]}, {"embedding": [0, 1]}]}).encode())
+        self.assertEqual(embed.post_embeddings(config.embed_config(), ["a", "b"], opener=op), [[1.0, 0.0], [0.0, 1.0]])
+        self.assertIsNone(op.requests[0].get_header("Authorization"))      # no key set, none sent
+        bad = [{"data": [{"embedding": [1, 0]}]},                           # one vector for two texts
+               {"data": [{"embedding": [1, 0]}, {"embedding": [1, 0, 0]}]},  # different sizes
+               {"data": [{"embedding": [0, 0]}, {"embedding": [1, 0]}]},    # all zeros
+               {"data": [{"embedding": "AAAA"}, {"embedding": [1, 0]}]},    # not a list of numbers
+               {"data": [{"embedding": [1, "x"]}, {"embedding": [1, 0]}]},
+               {"data": [{"embedding": [1, True]}, {"embedding": [1, 0]}]},
+               {"data": [{"index": 0, "embedding": [1, 0]}, {"index": 0, "embedding": [0, 1]}]},
+               {"data": [{"index": 5, "embedding": [1, 0]}, {"embedding": [0, 1]}]},
+               {"data": "no"}, {"result": []}, [1, 2]]
+        for answer in bad:
+            with self.assertRaises(embed.EmbedError, msg=answer) as cm:
+                embed.post_embeddings(cfg, ["a", "b"], opener=FakeOpener(json.dumps(answer).encode()))
+            self.assertEqual(cm.exception.kind, "response", answer)
+        for raw in (b"<html>not json</html>", b'{"data": [{"embedding": [NaN, 1]}, {"embedding": [1, 0]}]}',
+                    b'{"data": [{"embedding": [1e999, 1]}, {"embedding": [1, 0]}]}'):
+            with self.assertRaises(embed.EmbedError, msg=raw):
+                embed.post_embeddings(cfg, ["a", "b"], opener=FakeOpener(raw))
+
+    def test_an_answer_that_would_crash_a_parser_is_only_a_bad_answer(self):
+        self.configure()
+        cfg = config.embed_config()
+        huge = b'{"data": [{"embedding": [1' + b"0" * 400 + b', 1]}]}'       # a whole number no float can hold
+        for raw in (b"[" * 200000, huge):
+            with self.assertRaises(embed.EmbedError) as cm:
+                embed.post_embeddings(cfg, ["a"], opener=FakeOpener(raw))
+            self.assertEqual(cm.exception.kind, "response")
+        with self.assertRaises(store_mod.VectorError):
+            store_mod.unit_vector([10 ** 400, 1])
+
+    def test_an_answer_that_drips_in_or_never_ends_is_given_up_on(self):
+        self.configure()
+        cfg = config.embed_config()
+        good = json.dumps({"data": [{"embedding": [1, 0]}]}).encode()
+        got = embed.post_embeddings(cfg, ["a"], opener=FakeOpener(None, pieces=[good[:5], good[5:9], good[9:]]))
+        self.assertEqual(got, [[1.0, 0.0]])                                 # an answer in pieces is put together
+        clock = iter(range(0, 100000, 15))
+        real = embed.time.monotonic
+        self.addCleanup(setattr, embed.time, "monotonic", real)
+        embed.time.monotonic = lambda: next(clock)                          # 15 seconds pass at every look
+        with self.assertRaises(embed.EmbedError) as cm:
+            embed.post_embeddings(cfg, ["a"], timeout=20, opener=FakeOpener(None, pieces=[b" "] * 1000))
+        self.assertEqual(cm.exception.kind, "network")
+        self.assertIn("20 seconds", str(cm.exception))
+        embed.time.monotonic = real
+        old = embed.MAX_RESPONSE_BYTES
+        self.addCleanup(setattr, embed, "MAX_RESPONSE_BYTES", old)
+        embed.MAX_RESPONSE_BYTES = 1000
+        endless = FakeOpener(None, pieces=[b" " * 600] * 50)
+        with self.assertRaises(embed.EmbedError) as cm:
+            embed.post_embeddings(cfg, ["a"], opener=endless)
+        self.assertEqual(cm.exception.kind, "response")
+        self.assertGreater(len(endless.left), 40)                           # it stopped reading, it did not drain it
+
+    def test_the_address_is_hidden_even_when_only_its_path_is_echoed(self):
+        self.configure()
+        text = config.scrub("HTTP 404: Could not route to /client/v4/accounts/acct999/ai/v1/embeddings/embeddings; "
+                            "account acct999 unknown")
+        self.assertNotIn("acct999", text)
+        self.assertIn("HTTP 404", text)
+
+    def test_the_embeddings_settings_come_from_one_place(self):
+        (self.home / ".env").write_text(f"EXPERTISE_MINER_EMBED_URL={EMBED_URL}\nEXPERTISE_MINER_EMBED_MODEL=file-model\n"
+                                        f"EXPERTISE_MINER_EMBED_KEY={SECRET}\nPROXY_URL=http://file.example:1\n",
+                                        encoding="utf-8")
+        cfg = config.embed_config()
+        self.assertEqual((cfg["host"], cfg["model"], cfg["key"]), ("embed.example", "file-model", SECRET))
+        os.environ["EXPERTISE_MINER_EMBED_URL"] = "https://elsewhere.example/v1"
+        with self.assertRaises(ValueError):
+            config.embed_config()            # the file's model and key do not follow an address from the environment
+        os.environ["EXPERTISE_MINER_EMBED_MODEL"] = "env-model"
+        cfg = config.embed_config()
+        self.assertEqual((cfg["host"], cfg["model"], cfg["key"]), ("elsewhere.example", "env-model", ""))
+        self.assertEqual(config.proxy_routes(), ["http://file.example:1"])   # other settings still mix as before
+
+    def test_refusals_are_told_apart_and_a_redirect_is_never_followed(self):
+        self.configure()
+        cfg = config.embed_config()
+        kinds = {401: "auth", 403: "auth", 400: "request", 404: "request", 413: "request", 422: "request",
+                 429: "busy", 500: "busy", 503: "busy", 302: "request", 307: "request"}
+        for code, kind in kinds.items():
+            with self.assertRaises(embed.EmbedError) as cm:
+                embed.post_embeddings(cfg, ["a"], opener=FakeOpener(http_error(code, b'{"error": "no"}', 7)))
+            self.assertEqual((cm.exception.kind, cm.exception.retry_after), (kind, None if code < 400 else 7.0), code)
+        self.assertIn("redirect", str(cm.exception))
+        for exc in (embed.urllib.error.URLError("refused"), TimeoutError("slow"), ConnectionResetError("gone")):
+            with self.assertRaises(embed.EmbedError) as cm:
+                embed.post_embeddings(cfg, ["a"], opener=FakeOpener(exc))
+            self.assertEqual(cm.exception.kind, "network")
+        self.assertIsNone(embed._NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://evil.example/"))
+        handlers = embed._opener(cfg).handlers
+        self.assertTrue(any(isinstance(h, embed._NoRedirect) for h in handlers))
+        self.assertFalse(any(type(h) is embed.urllib.request.HTTPRedirectHandler for h in handlers))
+        self.configure(url="http://localhost:11434/v1", key="")
+        local = embed._opener(config.embed_config()).handlers
+        self.assertFalse(any(isinstance(h, embed.urllib.request.ProxyHandler) and h.proxies for h in local))
+
+
+class EmbedJobTests(EmbedBase):
+    def test_a_run_embeds_every_passage_once_and_a_second_run_sends_nothing(self):
+        self.configure(EXPERTISE_MINER_EMBED_BATCH="4")
+        st = self.corpus()
+        self.assertEqual(st.count_pending("model-a")["passages"], 6)
+        job, ep, jid = self.run_embed(st)
+        self.assertEqual((job["state"], job["counts"]["embedded"], job["counts"]["to_embed"]), ("done", 6, 6))
+        self.assertEqual([len(c) for c in ep.calls], [4, 2])
+        self.assertEqual(sorted(t for c in ep.calls for t in c), sorted(MONEY + ["my bankroll and my stake",
+                                                                                 "minutes played in a new role"]))
+        self.assertEqual(job["counts"]["characters_sent"], sum(len(t) for c in ep.calls for t in c))
+        self.assertEqual(st.vector_info(), {"model": "model-a", "dim": 6, "vectors": 6, "passages": 6})
+        self.assertNotIn(SECRET, (pull.jobs_dir() / f"{jid}.json").read_text())
+        self.assertNotIn("acct999", (pull.jobs_dir() / f"{jid}.json").read_text())
+        job, ep, _ = self.run_embed(st)
+        self.assertEqual((job["state"], ep.calls, job["counts"]["to_embed"]), ("done", [], 0))
+        st.upsert_video(self.video(VID_C, segments=[[0.0, "a new video about cash"]]))
+        job, ep, _ = self.run_embed(st)                                  # only what is new is sent
+        self.assertEqual(ep.calls, [["a new video about cash"]])
+
+    def test_a_run_can_be_limited_stopped_and_continued(self):
+        self.configure(EXPERTISE_MINER_EMBED_BATCH="2")
+        st = self.corpus()
+        job, ep, _ = self.run_embed(st, max_passages=3)
+        self.assertEqual((job["state"], job["counts"]["embedded"], [len(c) for c in ep.calls]), ("done", 3, [2, 1]))
+        jid = self.job()
+        ep = FakeEndpoint()
+
+        def stop_after_first(seconds):
+            (pull.jobs_dir() / f"{jid}.stop").write_text("stop")
+
+        job = embed.run_job(jid, sender=ep, sleep=stop_after_first, store=st)
+        self.assertEqual((job["state"], len(ep.calls)), ("stopped", 1))
+        self.assertEqual(st.vector_info()["vectors"], 5)
+        self.assertFalse((pull.jobs_dir() / f"{jid}.stop").exists())
+        job, ep, _ = self.run_embed(st)
+        self.assertEqual((job["state"], st.vector_info()["vectors"], len(ep.calls)), ("done", 6, 1))
+
+    def test_two_models_are_never_mixed(self):
+        self.configure()
+        st = self.corpus()
+        self.run_embed(st)
+        before = st.vector_info()
+        self.configure(model="model-b")
+        job, ep, _ = self.run_embed(st)
+        self.assertEqual((job["state"], ep.calls), ("failed", []))       # refused before anything was sent
+        self.assertIn("model-a", job["message"])
+        self.assertEqual(st.vector_info(), before)
+        with self.assertRaises(store_mod.VectorError):                   # and the store itself refuses
+            st.store_vectors("model-b", 6, [(1, MONEY[0], store_mod.unit_vector(fake_vector(MONEY[0])))])
+        with self.assertRaises(store_mod.VectorError):                   # the same name, another vector size
+            st.store_vectors("model-a", 3, [(1, MONEY[0], [1.0, 0.0, 0.0])])
+        with self.assertRaises(store_mod.VectorError):                   # a search cannot compare them either
+            st.search_vectors([store_mod.unit_vector(fake_vector("cash"))], "model-b")
+        self.assertEqual(st.vector_info(), before)
+        job, ep, _ = self.run_embed(st, reembed=True)
+        self.assertEqual((job["state"], sum(len(c) for c in ep.calls)), ("done", 6))
+        self.assertEqual(st.vector_info()["model"], "model-b")
+        models = {r[0] for r in st._db.execute("SELECT DISTINCT model FROM vectors")}
+        self.assertEqual(models, {"model-b"})
+
+    def test_a_refused_key_stops_at_once_and_a_busy_endpoint_is_waited_for_then_given_up_on(self):
+        self.configure(EXPERTISE_MINER_EMBED_BATCH="6")
+        st = self.corpus()
+        job, ep, jid = self.run_embed(st, FakeEndpoint([embed.EmbedError("auth", f"HTTP 401: bad key {SECRET}")]))
+        self.assertEqual((job["state"], len(ep.calls), self.sleeps), ("failed", 1, []))
+        self.assertIn("refused the key", job["message"])
+        self.assertNotIn(SECRET, (pull.jobs_dir() / f"{jid}.json").read_text())
+        busy = embed.EmbedError("busy", "HTTP 429", retry_after=9)
+        job, ep, _ = self.run_embed(st, FakeEndpoint([busy, embed.EmbedError("network", "URLError: x")]))
+        self.assertEqual((job["state"], len(ep.calls), self.sleeps[:2]), ("done", 3, [9, 4.0]))
+        st.clear_vectors()
+        job, ep, _ = self.run_embed(st, FakeEndpoint([embed.EmbedError("busy", "HTTP 503")] * 50))
+        self.assertEqual((job["state"], len(ep.calls)), ("blocked", embed.RETRIES))
+        self.assertEqual(self.sleeps, [2.0, 4.0, 8.0, 16.0])              # then it gave up: no more waiting
+        self.assertEqual(st.vector_info()["vectors"], 0)
+        slow = embed.EmbedError("busy", "HTTP 429", retry_after=99999)
+        job, ep, _ = self.run_embed(st, FakeEndpoint([slow]))
+        self.assertEqual(self.sleeps[0], embed.MAX_WAIT_S)                # a wait asked for is capped
+
+    def test_one_passage_the_endpoint_will_not_take_does_not_cost_the_rest(self):
+        self.configure(EXPERTISE_MINER_EMBED_BATCH="6")
+        st = self.corpus()
+
+        def picky(cfg, texts, timeout=0, opener=None):
+            calls.append(list(texts))
+            if any("rain" in t for t in texts):
+                raise embed.EmbedError("request", "HTTP 400: input too long")
+            return [store_mod.unit_vector(fake_vector(t)) for t in texts]
+
+        calls = []
+        job, _, _ = self.run_embed(st, picky)
+        self.assertEqual((job["state"], job["counts"]["embedded"], job["counts"]["skipped"]), ("done", 5, 1))
+        self.assertEqual([len(c) for c in calls], [6, 1, 1, 1, 1, 1, 1])
+        self.assertEqual(st.count_pending("model-a"), {"passages": 0, "characters": 0, "refused": 1})
+        self.assertEqual(self.sleeps, [0.2] * 7)                          # the pause follows every request
+        calls.clear()
+        job, _, _ = self.run_embed(st, picky)                             # the refused passage is not sent again
+        self.assertEqual((job["state"], calls, job["counts"]["refused_before"]), ("done", [], 1))
+        self.assertIn("refused before 1", job["message"])
+        job, _, _ = self.run_embed(st, picky, retry_refused=True)         # unless that is asked for
+        self.assertEqual((calls, job["counts"]["skipped"]), ([[MONEY[2]]], 1))
+        st.clear_vectors()
+        self.assertEqual(st.count_pending("model-a")["refused"], 0)       # another model starts with a clean slate
+        wrong = FakeEndpoint([embed.EmbedError("request", "HTTP 404: no such model")] * 50)
+        job, ep, _ = self.run_embed(st, wrong)
+        self.assertEqual((job["state"], len(ep.calls)), ("failed", 1 + embed.REJECT_STREAK))
+        self.assertIn("no such model", job["message"])
+        short = FakeEndpoint([lambda texts: [[1.0, 0.0]]] * 50)           # one vector, whatever was sent
+        job, ep, _ = self.run_embed(st, short)
+        self.assertEqual(job["state"], "done")                            # each single then had its one vector
+        self.assertEqual(st.vector_info()["dim"], 2)
+
+    def test_refused_passages_do_not_stand_in_the_way_of_the_rest(self):
+        self.configure(EXPERTISE_MINER_EMBED_BATCH="4")
+        st = self.open()
+        lines = [f"good line number {i} about cash" for i in range(4)] + [f"bad line {i} with rain" for i in range(7)] \
+            + [f"later good line {i} on minutes" for i in range(9)]
+        st.upsert_video(self.video(VID_A, segments=[[i * 40.0, t] for i, t in enumerate(lines)]))
+
+        def picky(cfg, texts, timeout=0, opener=None):
+            if any("rain" in t for t in texts):
+                raise embed.EmbedError("request", "HTTP 400: input too long")
+            return [store_mod.unit_vector(fake_vector(t)) for t in texts]
+
+        job, _, _ = self.run_embed(st, picky)
+        self.assertEqual((job["state"], job["counts"]["embedded"], job["counts"]["skipped"]), ("done", 13, 7))
+        self.assertEqual(st.count_pending("model-a"), {"passages": 0, "characters": 0, "refused": 7})
+        old = embed.LATE_REJECT_STREAK
+        self.addCleanup(setattr, embed, "LATE_REJECT_STREAK", old)
+
+    def test_a_passing_fault_at_the_endpoint_is_not_held_against_the_passages(self):
+        self.configure(EXPERTISE_MINER_EMBED_BATCH="4")
+        st = self.corpus()
+        self.run_embed(st)                                                # the endpoint has worked
+        st.upsert_video(self.video(VID_C, segments=[[i * 40.0, f"new line {i} about cash"] for i in range(12)]))
+        old = embed.LATE_REJECT_STREAK
+        self.addCleanup(setattr, embed, "LATE_REJECT_STREAK", old)
+        embed.LATE_REJECT_STREAK = 6
+        down = FakeEndpoint([embed.EmbedError("request", "HTTP 404: not here")] * 500)
+        job, _, _ = self.run_embed(st, down)                              # every request refused: the address, say
+        self.assertEqual((job["state"], job["counts"]["skipped"]), ("failed", 6))
+        self.assertEqual(st.count_pending("model-a")["refused"], 0)       # nothing was marked
+        broken = FakeEndpoint([embed.EmbedError("response", "the answer could not be used")] * 6)
+        job, _, _ = self.run_embed(st, broken)                            # unusable answers for a while, then fine
+        self.assertEqual(job["state"], "done")
+        self.assertEqual(st.count_pending("model-a"), {"passages": 4, "characters": 4 * len("new line 0 about cash"),
+                                                       "refused": 0})    # skipped this run, owed still, not marked
+        job, _, _ = self.run_embed(st)
+        self.assertEqual((job["state"], st.vector_info()["vectors"]), ("done", 18))
+        for bad in (float("nan"), float("inf")):
+            with self.assertRaises(pull.PullError):
+                embed.build_job({"max_passages": bad})
+
+    def test_nothing_is_remembered_as_refused_while_the_endpoint_has_never_worked(self):
+        self.configure()
+        st = self.corpus()
+        wrong = FakeEndpoint([embed.EmbedError("request", "HTTP 404: no such model")] * 50)
+        job, _, _ = self.run_embed(st, wrong)
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(st.count_pending("model-a"), {"passages": 6, "characters": sum(
+            len(t) for t in MONEY + ["my bankroll and my stake", "minutes played in a new role"]), "refused": 0})
+        job, ep, _ = self.run_embed(st)                                   # once the address is right, all are sent
+        self.assertEqual((job["state"], job["counts"]["embedded"]), ("done", 6))
+
+    def test_an_endpoint_that_takes_one_text_at_a_time_is_paced_and_the_person_is_told(self):
+        self.configure(EXPERTISE_MINER_EMBED_BATCH="3")
+        st = self.corpus()
+
+        def one_only(cfg, texts, timeout=0, opener=None):
+            calls.append(len(texts))
+            if len(texts) > 1:
+                raise embed.EmbedError("request", "HTTP 400: one input per request")
+            return [store_mod.unit_vector(fake_vector(t)) for t in texts]
+
+        calls = []
+        job, _, jid = self.run_embed(st, one_only)
+        self.assertEqual((job["state"], job["counts"]["embedded"], calls), ("done", 6, [3, 1, 1, 1, 3, 1, 1, 1]))
+        self.assertEqual(self.sleeps, [0.2] * 8)                          # one pause for every request made
+        self.assertEqual(embed.build_job({"delay_ms": 0})["delay_ms"], embed.MIN_DELAY_MS)
+
+    def test_yes_and_no_must_be_said_as_such_before_anything_is_deleted(self):
+        self.configure()
+        st = self.corpus()
+        self.run_embed(st)
+        for bad in ("false", "no", "true", 1, 0):
+            with self.assertRaises(pull.PullError, msg=bad):
+                embed.build_job({"reembed": bad})
+            with self.assertRaises(pull.PullError, msg=bad):
+                embed.build_job({"retry_refused": bad})
+        for bad in ("10", 1.5, True):
+            with self.assertRaises(pull.PullError, msg=bad):
+                embed.build_job({"max_passages": bad})
+        self.assertFalse(embed.build_job({"reembed": False})["reembed"])
+        self.assertEqual(st.vector_info()["vectors"], 6)
+
+    def test_a_worker_that_was_taken_for_dead_removes_nothing(self):
+        self.configure()
+        st = self.corpus()
+        self.run_embed(st)
+        late = self.job(reembed=True)
+        other = self.job()
+        pull._acquire_slot(other, pull.EMBED_LOCK)                        # another run owns the slot now
+        ep = FakeEndpoint()
+        job = embed.run_job(late, sender=ep, sleep=lambda s: None, store=st)
+        self.assertEqual((job["state"], ep.calls, st.vector_info()["vectors"]), ("failed", [], 6))
+        self.assertEqual(pull.slot_holder(pull.EMBED_LOCK), other)
+
+    def test_the_real_worker_starts_runs_and_ends_on_an_empty_corpus(self):
+        """Nothing is stored, so nothing is owed and nothing is sent: this starts the process for real."""
+        self.configure(url="https://embed.invalid/v1")
+        import server as server_mod
+        server_mod._store = store_mod.open_store(config.storage_config())
+        self.addCleanup(lambda: (server_mod._store.close(), setattr(server_mod, "_store", None)))
+        view = server_mod.t_embed_start({})
+        self.assertIn("embed.py", view["wait_command"])
+        r = subprocess.run([sys.executable, str(ROOT / "server" / "embed.py"), "wait", view["id"]],
+                           capture_output=True, text=True, timeout=120, env=dict(os.environ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = server_mod.t_embed_status({"job_id": view["id"]})
+        self.assertEqual((got["state"], got["counts"]["requests"]), ("done", 0))
+        self.assertEqual(pull.slot_holder(pull.EMBED_LOCK), "")
+        blob = (pull.jobs_dir() / f"{view['id']}.json").read_text() + (pull.jobs_dir() / f"{view['id']}.log").read_text()
+        self.assertNotIn(SECRET, blob)
+        with self.assertRaises(pull.PullError):
+            server_mod.t_embed_start({"reembed": "false"})
+
+    def test_settings_changed_under_a_job_and_other_stores_are_refused(self):
+        self.configure()
+        st = self.corpus()
+        jid = self.job()
+        self.configure(model="model-b")
+        ep = FakeEndpoint()
+        job = embed.run_job(jid, sender=ep, sleep=lambda s: None, store=st)
+        self.assertEqual((job["state"], ep.calls), ("failed", []))
+        os.environ.update({"EXPERTISE_MINER_STORE": "mongo", "MONGO_HOST": "db.example"})
+        with self.assertRaises(pull.PullError):
+            embed.build_job({})
+        for k in ("EXPERTISE_MINER_STORE", "MONGO_HOST", "EXPERTISE_MINER_EMBED_URL", "EXPERTISE_MINER_EMBED_MODEL",
+                  "EXPERTISE_MINER_EMBED_KEY"):
+            del os.environ[k]
+        with self.assertRaises(pull.PullError):
+            embed.build_job({})                                           # nothing configured
+        self.configure()
+        with self.assertRaises(pull.PullError):
+            embed.build_job({"max_passages": -1})
+
+    def test_an_embedding_run_and_a_pull_have_separate_slots(self):
+        self.configure()
+        a, b = self.job(), self.job()
+        pull._acquire_slot(a, pull.EMBED_LOCK)
+        with self.assertRaises(pull.PullError) as cm:
+            pull._acquire_slot(b, pull.EMBED_LOCK)
+        self.assertIn("embedding run", str(cm.exception))
+        p = pull.build_job({"kind": "video", "target": VID_A})
+        pull.write_job(p)
+        pull._acquire_slot(p["id"])                                       # a pull is not held up by it
+        self.assertEqual((pull.slot_holder(), pull.slot_holder(pull.EMBED_LOCK)), (p["id"], a))
+        pull._release_slot(a, pull.EMBED_LOCK)
+        self.assertEqual(pull.slot_holder(), p["id"])
+
+
+class VectorStoreTests(EmbedBase):
+    def embedded(self):
+        self.configure()
+        st = self.corpus()
+        self.run_embed(st)
+        return st
+
+    def nearest(self, st, text, **kw):
+        got = st.search_vectors([store_mod.unit_vector(fake_vector(text))], "model-a", **kw)[0]
+        return [(h["video_id"], h["idx"]) for h in got]
+
+    def test_the_nearest_passages_come_first_and_a_channel_can_be_chosen(self):
+        st = self.embedded()
+        self.assertEqual(self.nearest(st, "bankroll", limit=2), [(VID_A, 0), (VID_B, 0)])
+        self.assertEqual(self.nearest(st, "weather", limit=1), [(VID_A, 2)])
+        self.assertEqual(self.nearest(st, "bankroll", channel="@other", limit=1), [(VID_B, 0)])
+        self.assertEqual(len(self.nearest(st, "bankroll", limit=60)), 6)
+        two = st.search_vectors([store_mod.unit_vector(fake_vector(t)) for t in ("weather", "defense")], "model-a", limit=1)
+        self.assertEqual([(h[0]["video_id"], h[0]["idx"]) for h in two], [(VID_A, 2), (VID_A, 1)])
+        with self.assertRaises(store_mod.VectorError):
+            st.search_vectors([[1.0, 0.0]], "model-a")                    # a query of another size
+
+    def test_without_numpy_small_corpora_work_and_large_ones_are_refused(self):
+        st = self.embedded()
+        real = store_mod._numpy
+        self.addCleanup(setattr, store_mod, "_numpy", real)
+        store_mod._numpy = lambda: None
+        plain = self.nearest(st, "bankroll")
+        old = store_mod.PURE_PYTHON_VECTORS
+        self.addCleanup(setattr, store_mod, "PURE_PYTHON_VECTORS", old)
+        store_mod.PURE_PYTHON_VECTORS = 5
+        with self.assertRaises(store_mod.VectorError) as cm:
+            self.nearest(st, "bankroll")
+        self.assertIn("numpy", str(cm.exception))
+        store_mod._numpy = real
+        if real() is not None:                                            # where numpy is installed: same answer
+            self.assertEqual(self.nearest(st, "bankroll"), plain)
+
+    @unittest.skipIf(store_mod._numpy() is None, "numpy is not installed")
+    def test_numpy_and_plain_python_rank_alike(self):
+        st = self.embedded()
+        old = store_mod._SCAN_ROWS
+        self.addCleanup(setattr, store_mod, "_SCAN_ROWS", old)
+        store_mod._SCAN_ROWS = 2                                          # several blocks
+        with_np = [st.search_vectors([store_mod.unit_vector(fake_vector(t))], "model-a")[0] for t in CONCEPTS]
+        real = store_mod._numpy
+        self.addCleanup(setattr, store_mod, "_numpy", real)
+        store_mod._numpy = lambda: None
+        plain = [st.search_vectors([store_mod.unit_vector(fake_vector(t))], "model-a")[0] for t in CONCEPTS]
+        self.assertEqual(with_np, plain)
+
+    def test_vectors_follow_the_text_they_were_made_from(self):
+        st = self.embedded()
+        st.upsert_video(self.video(VID_A, title="Pulled again", segments=[[i * 40.0, t] for i, t in enumerate(MONEY)]))
+        self.assertEqual(st.count_pending("model-a")["passages"], 0)     # same text: nothing to pay for again
+        changed = [MONEY[0], "now this passage is about the weather", MONEY[2]]
+        st.upsert_video(self.video(VID_A, segments=[[i * 40.0, t] for i, t in enumerate(changed)]))
+        self.assertEqual(st.count_pending("model-a"), {"passages": 1, "characters": len(changed[1]), "refused": 0})
+        self.assertEqual(st.vector_info()["vectors"], 4)
+        self.assertNotIn((VID_A, 1), self.nearest(st, "defense"))        # the old passage's vector went with it
+        orphans = st._db.execute("SELECT COUNT(*) FROM vectors WHERE passage_id NOT IN (SELECT id FROM passages)").fetchone()[0]
+        self.assertEqual(orphans, 0)
+
+    def test_a_rebuilt_index_keeps_the_vectors(self):
+        st = self.embedded()
+        st.close()
+        os.environ["EXPERTISE_MINER_SEARCH_STEMMING"] = "off"            # empties and rebuilds the passage index
+        st2 = self.open()
+        self.assertEqual(st2.vector_info(), {"model": "model-a", "dim": 6, "vectors": 6, "passages": 6})
+        self.assertEqual(st2.count_pending("model-a")["passages"], 0)
+        self.assertEqual(self.nearest(st2, "weather", limit=1), [(VID_A, 2)])
+        self.assertEqual(st2._db.execute("SELECT COUNT(*) FROM vectors_kept").fetchone()[0], 0)
+
+    def test_a_vector_left_behind_by_an_older_version_is_never_used_for_another_passage(self):
+        st = self.embedded()
+        pid = st._db.execute("SELECT id FROM passages WHERE video_id = ? AND idx = 2", (VID_A,)).fetchone()[0]
+        raw = sqlite3.connect(str(self.home / "corpus.db"))              # what a 0.2 process would do: it
+        raw.execute("UPDATE passages SET text = ? WHERE id = ?", ("words about minutes played", pid))
+        raw.commit()                                                     # knows nothing of the vectors table
+        raw.close()
+        self.assertNotIn((VID_A, 2), self.nearest(st, "weather"))        # the weather vector is not this text's
+        self.assertEqual(st.count_pending("model-a")["passages"], 1)     # and the passage is owed a new one
+        job, ep, _ = self.run_embed(st)
+        self.assertEqual(ep.calls, [["words about minutes played"]])
+        self.assertIn((VID_A, 2), self.nearest(st, "minutes", limit=2))
+
+    def test_a_vector_is_not_stored_for_a_passage_that_changed_while_its_text_was_away(self):
+        self.configure()
+        st = self.corpus()
+        pending, _, _ = st.pending_passages("model-a", limit=10)
+        pid, text = pending[0]
+        st.upsert_video(self.video(VID_A, segments=[[0.0, "entirely different words now"]]))
+        stored = st.store_vectors("model-a", 6, [(pid, text, store_mod.unit_vector(fake_vector(text)))])
+        self.assertEqual(stored, 0)
+
+
+class HybridSearchTests(EmbedBase):
+    def setUp(self):
+        super().setUp()
+        import server as server_mod
+        self.server = server_mod
+        self.configure()
+        server_mod._store = self.corpus(store_mod.open_store(config.storage_config()))
+        self.addCleanup(lambda: (server_mod._store.close(), setattr(server_mod, "_store", None)))
+        self.run_embed(server_mod._store)
+        self.endpoint = FakeEndpoint()
+        self.real_post = embed.post_embeddings
+        self.addCleanup(setattr, embed, "post_embeddings", self.real_post)
+        embed.post_embeddings = self.endpoint
+
+    def found(self, got):
+        return {(r["video_id"], p["seconds"]): p.get("found_by") for r in got["results"] for p in r["passages"]}
+
+    def test_a_passage_that_says_it_in_other_words_is_found_by_meaning(self):
+        got = self.server.t_search({"query": "bankroll", "passages_per_video": 10})
+        self.assertEqual(self.endpoint.calls, [["bankroll"]])              # the wording, and only that, was sent
+        self.assertTrue(got["by_meaning"]["used"])
+        found = self.found(got)
+        self.assertEqual(found[(VID_B, 0)], "both")                       # holds the word, and is near in meaning
+        self.assertEqual(found[(VID_A, 0)], "meaning")                    # "cash i put in play": no word in common
+        self.assertEqual(got["results"][0]["video_id"], VID_B)            # found both ways comes first
+        self.assertEqual(got["wordings"][0]["found_by_meaning"], 6)
+        self.assertIn("may hold none of the words", got["note"])
+        self.assertNotIn(SECRET, json.dumps(got))
+
+    def test_meaning_is_left_out_when_asked_and_when_every_word_is_required(self):
+        got = self.server.t_search({"query": "bankroll", "by_meaning": False})
+        self.assertEqual((self.endpoint.calls, got["by_meaning"]["used"], got["videos"]), ([], False, 1))
+        self.assertNotIn("found_by", got["results"][0]["passages"][0])
+        got = self.server.t_search({"query": "bankroll", "match": "all"})
+        self.assertEqual((self.endpoint.calls, got["by_meaning"]["used"], got["videos"]), ([], False, 1))
+        self.assertIn("not a search by meaning", got["note"])
+        with self.assertRaises(ValueError):
+            self.server.t_search({"query": "bankroll", "by_meaning": "yes"})
+
+    def test_several_wordings_go_in_one_request_and_a_channel_still_limits_the_search(self):
+        got = self.server.t_search({"query": "bankroll", "queries": ["weather"], "channel": "Some Expert",
+                                    "passages_per_video": 10})
+        self.assertEqual(self.endpoint.calls, [["bankroll", "weather"]])
+        self.assertEqual({r["video_id"] for r in got["results"]}, {VID_A})
+
+    def test_a_search_still_answers_by_words_when_the_endpoint_does_not(self):
+        self.endpoint.script = [embed.EmbedError("network", f"URLError: cannot reach {EMBED_URL} with Bearer {SECRET}")]
+        got = self.server.t_search({"query": "bankroll"})
+        self.assertEqual((got["by_meaning"]["used"], got["videos"]), (False, 1))
+        self.assertIn("URLError", got["by_meaning"]["why_not"])
+        for secret in (SECRET, "acct999"):
+            self.assertNotIn(secret, json.dumps(got))
+        self.endpoint.script = [lambda texts: [[1.0, 0.0]]]               # the endpoint changed its vector size
+        got = self.server.t_search({"query": "bankroll"})
+        self.assertEqual((got["by_meaning"]["used"], got["videos"]), (False, 1))
+
+    def test_whatever_the_endpoint_answers_the_search_by_words_stands(self):
+        huge = b'{"data": [{"embedding": [1' + b"0" * 400 + b', 1]}]}'
+        real = embed._opener
+        self.addCleanup(setattr, embed, "_opener", real)
+        embed.post_embeddings = self.real_post                            # the real request code, a stand-in socket
+        for raw in (b"[" * 200000, huge, b"", b"\xff\xfe"):
+            embed._opener = lambda cfg, raw=raw: FakeOpener(raw)
+            got = self.server.t_search({"query": "bankroll"})
+            self.assertEqual((got["by_meaning"]["used"], got["videos"]), (False, 1), raw[:20])
+        embed.post_embeddings = lambda *a, **k: (_ for _ in ()).throw(MemoryError("anything at all"))
+        got = self.server.t_search({"query": "bankroll"})
+        self.assertEqual((got["by_meaning"]["used"], got["videos"]), (False, 1))
+        self.assertIn("MemoryError", got["by_meaning"]["why_not"])
+
+    def test_an_echoed_path_does_not_carry_the_account_into_a_result(self):
+        self.endpoint.script = [embed.EmbedError(
+            "request", "HTTP 404: Could not route to /client/v4/accounts/acct999/ai/v1/embeddings/embeddings")]
+        got = self.server.t_search({"query": "bankroll"})
+        self.assertIn("HTTP 404", got["by_meaning"]["why_not"])
+        self.assertNotIn("acct999", json.dumps(got))
+
+    def test_without_numpy_a_large_corpus_is_searched_by_words_and_says_why(self):
+        for name, value in (("_numpy", lambda: None), ("PURE_PYTHON_VECTORS", 5)):
+            self.addCleanup(setattr, store_mod, name, getattr(store_mod, name))
+            setattr(store_mod, name, value)
+        got = self.server.t_search({"query": "bankroll"})
+        self.assertEqual((got["by_meaning"]["used"], got["videos"]), (False, 1))
+        self.assertIn("numpy", got["by_meaning"]["why_not"])
+        check = self.server.t_setup_check({})
+        self.assertTrue(any("numpy" in p for p in check["problems"]))
+        self.assertIn("numpy", check["embeddings"]["install_command"])
+
+    def test_a_wording_with_no_searchable_words_is_still_searched_by_meaning(self):
+        got = self.server.t_search({"query": "???"})
+        self.assertEqual((self.endpoint.calls, got["by_meaning"]["used"]), ([["???"]], True))
+        with self.assertRaises(ValueError):
+            self.server.t_search({"query": "???", "by_meaning": False})
+
+    def test_vectors_by_another_model_are_not_used(self):
+        self.configure(model="model-b")
+        got = self.server.t_search({"query": "bankroll"})
+        self.assertEqual((self.endpoint.calls, got["by_meaning"]["used"]), ([], False))
+        self.assertIn("model-a", got["by_meaning"]["why_not"])
+        with self.assertRaises(pull.PullError) as cm:
+            self.server.t_embed_start({})                                 # refused before any process is started
+        self.assertIn("reembed", str(cm.exception))
+        self.assertEqual([j for j in pull.list_jobs(50) if j["state"] == "starting" and not j.get("counts", {}).get("embedded")
+                          and j["model"] == "model-b"], [])
+
+    def test_with_nothing_set_search_is_by_words_and_sends_nothing(self):
+        for k in ("EXPERTISE_MINER_EMBED_URL", "EXPERTISE_MINER_EMBED_MODEL", "EXPERTISE_MINER_EMBED_KEY"):
+            del os.environ[k]
+        got = self.server.t_search({"query": "bankroll"})
+        self.assertEqual((self.endpoint.calls, got["by_meaning"]), ([], {"used": False, "why_not": "no embeddings endpoint is set"}))
+        os.environ["EXPERTISE_MINER_EMBED_URL"] = "http://not-local.example/v1"
+        os.environ["EXPERTISE_MINER_EMBED_MODEL"] = "m"
+        got = self.server.t_search({"query": "bankroll"})                 # wrong settings do not break search
+        self.assertEqual((self.endpoint.calls, got["by_meaning"]["used"], got["videos"]), ([], False, 1))
+        with self.assertRaises(pull.PullError):
+            self.server.t_embed_status({})
+
+    def test_status_says_what_a_run_would_send_and_tools_keep_to_their_own_jobs(self):
+        st = self.server._store
+        st.upsert_video(self.video(VID_C, segments=[[0.0, "one more passage about cash"]]))
+        got = self.server.t_embed_status({})
+        self.assertEqual(got["not_embedded_yet"],
+                         {"passages": 1, "characters": len("one more passage about cash"), "refused": 0})
+        self.assertEqual((got["stored"]["vectors"], got["stored"]["passages"], got["endpoint"]), (6, 7, "embed.example"))
+        self.assertEqual([j["kind"] for j in got["jobs"]], ["embed"])
+        self.assertEqual(self.endpoint.calls, [])                         # reading the status sends nothing
+        for secret in (SECRET, "acct999"):
+            self.assertNotIn(secret, json.dumps(got))
+        jid = got["jobs"][0]["id"]
+        self.assertEqual(self.server.t_embed_status({"job_id": jid})["state"], "done")
+        self.assertEqual(self.server.t_pull_status({"job_id": jid})["kind"], "embed")
+        self.assertEqual(self.server.t_pull_status({})["jobs"], [])       # the list of pulls holds pulls only
+        for tool in (self.server.t_pull_resume, self.server.t_pull_stop):
+            with self.assertRaises(pull.PullError):
+                tool({"job_id": jid})
+        p = pull.build_job({"kind": "video", "target": VID_A})
+        pull.write_job(p)
+        for tool in (self.server.t_embed_status, self.server.t_embed_stop):
+            with self.assertRaises(pull.PullError):
+                tool({"job_id": p["id"]})
+
+    def test_setup_check_reports_embeddings_without_the_key_and_contacts_nothing(self):
+        got = self.server.t_setup_check({})
+        e = got["embeddings"]
+        self.assertEqual((e["configured"], e["model"], e["endpoint"], e["key_set"]), (True, "model-a", "embed.example", True))
+        self.assertEqual(e["stored"]["vectors"], 6)
+        self.assertIn("embed.example", e["sends"])
+        self.assertEqual(self.endpoint.calls, [])
+        for secret in (SECRET, "acct999"):
+            self.assertNotIn(secret, json.dumps(got))
+        self.configure(model="model-b")
+        self.assertTrue(any("model-a" in p for p in self.server.t_setup_check({})["problems"]))
+
+
 class ServerTests(Base):
     def rpc(self, *calls):
         self.open().upsert_video(self.video())
@@ -844,7 +1622,8 @@ class ServerTests(Base):
         names = {t["name"] for t in out[1]["result"]["tools"]}
         self.assertEqual(names, {"setup_check", "pull_channel", "pull_playlist", "pull_video", "pull_status",
                                  "pull_resume", "pull_stop", "search_transcripts", "get_transcript",
-                                 "list_corpus", "mine_prepare", "mine_verify", "mine_build"})
+                                 "list_corpus", "mine_prepare", "mine_verify", "mine_build",
+                                 "embed_status", "embed_start", "embed_stop"})
         self.assertEqual(self.body(out[2])["channels"][0]["videos"], 1)
         hit = self.body(out[3])["results"][0]
         self.assertEqual((hit["video_id"], hit["passages"][0]["at"]), (VID_A, "00:00"))
