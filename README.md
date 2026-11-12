@@ -72,7 +72,7 @@ For finding out how an expert actually works, from what they have said on YouTub
 
 > **Read this before you run it.**
 >
-> - It makes automated requests to YouTube from your address, slowly on purpose. YouTube may still refuse an address that asks for a lot; the pull then stops itself.
+> - It makes automated requests to YouTube from your address, slowly on purpose. YouTube may still refuse an address that asks for a lot; the pull then stops using it, and stops itself when no other proxy route is left (without a proxy, at once).
 > - Whether collecting and studying a channel's transcripts is acceptable for your purpose is your decision.
 > - Mined items report what was said. Nothing checks whether it is true.
 > - **Status: new.** Tried on Windows, on a handful of videos, with SQLite and no proxy. Search by meaning has been tested against a stand-in endpoint only.

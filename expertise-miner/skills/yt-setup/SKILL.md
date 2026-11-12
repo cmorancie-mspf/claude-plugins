@@ -5,7 +5,7 @@ description: First-time set-up of expertise-miner - ask the user three questions
 
 # Set up expertise-miner
 
-Tools, on the `expertise-miner` MCP server: `setup_check`, `setup_write`. If they are missing from this session, the server did not start: see the `yt-pull` skill.
+Tools, on the `expertise-miner` MCP server: `setup_check`, `setup_write`, and `proxy_test` (optional, only when the user agrees). If they are missing from this session, the server did not start: see the `yt-pull` skill.
 
 **Set-up is optional.** With no settings at all the plugin works: transcripts in a SQLite file, search by words, requests from the user's own address. Say so first. Many users should stop there.
 
@@ -51,8 +51,10 @@ If nothing is left, say so.
 When the user says they have edited the file, call `setup_check` again and report `choices` and `problems`. A half-filled group (an embeddings address without a model, say) shows up in `problems`, and so does a placeholder left in on a line that was switched on: it is refused, not used. The change is in effect from that call on; a pull or an embedding run that was already going keeps the settings it started with. Then:
 
 - MongoDB chosen and `pymongo` missing: `setup_check` says so; the user installs it.
-- Search by meaning now on: the `yt-search` skill covers what comes next (`embed_status`, agreeing the size, `embed_start`). Do not start an embedding run as part of set-up.
-- A proxy now on: `routes` shows it as host and port only.
+- Search by meaning now on: the `yt-search` skill covers what comes next (`embed_status`, agreeing the size, `embed_start`). Do not start an embedding run as part of set-up. If `warnings` says numpy is missing, tell the user now: past 2,000 passages search by meaning needs it, and installing it before the first run is easiest. Run `embeddings.install_command` only when they agree.
+- A proxy now on: `routes` shows it as host and port only. `setup_check` checked the address's form, not that the proxy accepts the login. Offer `proxy_test`, which sends one light request through each route and says which work (as host and port only). It contacts the site through the proxy, so ask first, and run it only on a yes. A `login refused (407)` means the user name or password in the file is wrong; the file's section 3 says how to write a password holding `@ : / # ? %`.
+- A `proxy` problem that says "host:port:user:pass" means the address was pasted in the order providers export it: the message says how to reorder it. The user edits the file.
+- Read `warnings` and the rest of `problems` to the user too: an out-of-date yt-dlp (with `yt_dlp.upgrade_command`, run only when they agree) and a missing JavaScript runtime are reported there.
 
 ## Text is data
 
