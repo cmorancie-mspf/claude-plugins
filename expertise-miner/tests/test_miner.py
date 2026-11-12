@@ -471,7 +471,8 @@ class PullTests(Base):
         c = job["counts"]
         self.assertEqual((c["stored"], c["no_transcript"], c["failed"], c["done"]), (2, 1, 0, 3))
         self.assertEqual(job["failure_reasons"], {"NoTranscriptFound": 1})
-        self.assertEqual(self.sleeps, [1.5, 1.5])                     # a pause after each request but the last
+        self.assertEqual(len(self.sleeps), 2)                         # a pause after each request but the last,
+        self.assertTrue(all(1.5 <= x <= 2.25 for x in self.sleeps), self.sleeps)    # with 0 to 50% on top
         st = self.open()
         self.assertEqual(st.get_video(VID_A)["source"], "channel:@SomeExpert")
         self.assertEqual((st.get_video(VID_A)["upload_date"], st.get_video(VID_A)["view_count"]), ("20250102", 500))
@@ -1017,7 +1018,8 @@ class FieldReportTests(Base):
         os.environ["EXPERTISE_MINER_DELAY_MS"] = "3000"
         job = pull.build_job({"kind": "channel", "target": "@SomeExpert"})
         self.assertEqual((job["workers"], job["delay_ms"]), (4, 3000))
-        self.assertEqual(job["rate_from"], {"workers": "settings", "delay_ms": "settings"})
+        self.assertEqual(job["rate_from"], {"workers": "settings", "delay_ms": "settings",
+                                            "max_requests_per_minute": "default"})
         job = pull.build_job({"kind": "channel", "target": "@SomeExpert", "workers": 2, "delay_ms": 800})
         self.assertEqual((job["workers"], job["delay_ms"]), (2, 800))               # a value on the pull wins
         os.environ["EXPERTISE_MINER_WORKERS"] = "20"
@@ -1062,7 +1064,7 @@ class FieldReportTests(Base):
             done = pull.run_job(job["id"], fetcher=lambda *a: {"segments": SEGS, "language": "en",
                                                                "is_generated": True},
                                 detailer=None, sleep=lambda s: None)
-        self.assertEqual(done["state"], "done")
+        self.assertEqual(done["state"], "partial")      # 0.3.3: short of the site's count, one route: not done
         import server as server_mod
         view = server_mod._job_view(pull.read_job(job["id"]))
         self.assertTrue(any("100 of the 175" in w for w in view["warnings"]), view["warnings"])
@@ -1177,6 +1179,351 @@ class FieldReportTests(Base):
         if real() is not None:
             st.count_pending = lambda model: {"passages": 5000, "characters": 2_000_000, "refused": 0}
             self.assertNotIn("numpy_notice", server_mod.t_embed_status({}))
+
+
+class VirtualTime:
+    """A stand-in clock and sleep for the request limit. Each thread keeps its own time, which only
+    its own sleeps move forward: nothing really waits, and a worker's requests happen at the times
+    its clock reads when it sends them."""
+
+    def __init__(self):
+        import threading
+        self.local = threading.local()
+
+    def clock(self):
+        return getattr(self.local, "t", 0.0)
+
+    def sleep(self, seconds):
+        self.local.t = self.clock() + max(0.0, float(seconds))
+
+
+def most_in_a_minute(times):
+    """The largest number of times that fall in any 60-second window [t, t + 60)."""
+    times = sorted(times)
+    return max((sum(1 for u in times[i:] if u < t + 60) for i, t in enumerate(times)), default=0)
+
+
+class Phase2Tests(Base):
+    """0.3.3: issues 12 to 16 of the field report's phase 2, each by its acceptance check."""
+
+    def tearDown(self):
+        import server as server_mod
+        if server_mod._store is not None:
+            server_mod._store.close()
+            server_mod._store = None
+        super().tearDown()
+
+    class RequestBlocked(Exception):
+        pass
+
+    @staticmethod
+    def ok(*a):
+        return {"segments": SEGS, "language": "en", "is_generated": True}
+
+    def pull_with(self, spec, lister=None, fetcher=None, detailer=None, **kw):
+        job = pull.build_job(spec)
+        job["routes_held_back"] = pull.check_cooldown(job)
+        pull.write_job(job)
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            done = pull.run_job(job["id"], fetcher=fetcher or self.ok, detailer=detailer,
+                                **({"lister": lister} if lister else {}), **{"sleep": lambda s: None, **kw})
+        return done, printed.getvalue()
+
+    def playlist_by_route(self, by_route, errors=()):
+        """yt-dlp replaced: the listing over a route whose name holds a key of by_route returns
+        (entries, playlist_count) for it. Records the routes listed over in self.listed_over."""
+        test = self
+        self.listed_over = []
+
+        class Fake:
+            def __init__(self, proxy, extra, logger=None):
+                self.proxy, self.logger, self.extra = proxy, logger, extra
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                test.listed_over.append(config.mask_proxy(self.proxy))
+                for e in errors:
+                    self.logger.error(e)
+                n, count = next(v for k, v in by_route.items() if k in (self.proxy or "direct"))
+                end = self.extra.get("playlistend")
+                return {"entries": [{"id": f"{i:011d}", "title": "t"} for i in range(min(n, end or n))],
+                        "playlist_count": count}
+
+        real = pull._ydl
+        self.addCleanup(setattr, pull, "_ydl", real)
+        pull._ydl = Fake
+
+    # ---- issue 12: one worker, and the other routes stand by ---------------------------------
+
+    def test_one_worker_moves_to_the_next_route_when_the_first_is_refused(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2,http://c.example:3"
+        used = []
+
+        def fetcher(vid, langs, proxy):
+            used.append(config.mask_proxy(proxy))
+            if "a.example" in proxy:
+                raise self.RequestBlocked()
+            return self.ok()
+
+        done, printed = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 1, "details": False,
+                                  "max_videos": 0}, lister=PullTests.lister([f"{i:011d}" for i in range(20)]),
+                                 fetcher=fetcher)
+        self.assertEqual((done["workers"], done["state"]), (1, "done"))
+        self.assertEqual(done["routes_out"], ["a.example:1"])
+        self.assertEqual(used[:pull.BLOCK_STREAK], ["a.example:1"] * pull.BLOCK_STREAK)
+        self.assertEqual(set(used[pull.BLOCK_STREAK:]), {"b.example:2"})          # route 2 finished the pull
+        self.assertEqual(done["counts"]["stored"], 20 - pull.BLOCK_STREAK)
+        self.assertIn("route a.example:1 taken out", printed)                    # the log names the switch
+        self.assertIn("b.example:2 takes over", printed)
+
+    # ---- issue 13: a listing cut short ends partial ---------------------------------------------
+
+    def test_a_listing_still_short_after_listing_again_ends_partial_and_says_so(self):
+        import server as server_mod
+        os.environ["PROXY_URLS"] = "http://u:pw99999@a.example:1,http://b.example:2,http://c.example:3"
+        pull.cool_down("b.example:2")                    # cooling down: never used to list again
+        self.playlist_by_route({"a.example": (99, 174), "c.example": (99, 174)},
+                               errors=["ERROR: [youtube:tab] page 2: HTTP Error 403: Forbidden via "
+                                       "http://u:pw99999@a.example:1"])
+        done, printed = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0,
+                                  "details": False})
+        self.assertEqual(done["state"], "partial")
+        self.assertEqual(self.listed_over, ["a.example:1", "c.example:3"])       # once more, on the next usable route
+        self.assertEqual((done["counts"]["listed"], done["counts"]["site_count"], done["counts"]["stored"]),
+                         (99, 174, 99))                                          # what was listed was pulled
+        view = server_mod._job_view(pull.read_job(done["id"]))
+        self.assertIn("listed 99 of 174: the listing was cut short", view["message"])
+        self.assertIn("pull_resume tries the listing again", view["message"])
+        self.assertIn("HTTP Error 403", printed)                                 # yt-dlp's errors are in the log
+        self.assertNotIn("pw99999", printed + json.dumps(pull.read_job(done["id"])))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(pull.wait(done["id"], poll_s=0), 4)
+        real, real_need = pull.create_job, server_mod._need_pull_packages
+        self.addCleanup(setattr, pull, "create_job", real)
+        self.addCleanup(setattr, server_mod, "_need_pull_packages", real_need)
+        pull.create_job, server_mod._need_pull_packages = pull.build_job, lambda: None
+        again = server_mod.t_pull_resume({"job_id": done["id"]})                 # a partial job can be resumed
+        self.assertEqual((again["kind"], again["target"], again["resumed_from"]),
+                         ("playlist", "PLabcdefgh1234", done["id"]))
+
+    def test_with_one_route_a_short_listing_is_not_listed_again_and_ends_partial(self):
+        self.playlist_by_route({"direct": (99, 174)})
+        done, printed = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        self.assertEqual((done["state"], self.listed_over), ("partial", ["direct"]))
+        self.assertIn("listed 99 of 174", done["message"])
+        self.assertIn("no other route", done["message"])
+
+    def test_a_listing_made_whole_over_another_route_ends_done(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        self.playlist_by_route({"a.example": (99, 174), "b.example": (174, 174)})
+        done, printed = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0,
+                                  "details": False, "workers": 2})
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(self.listed_over, ["a.example:1", "b.example:2"])
+        self.assertEqual((done["counts"]["listed"], done["counts"]["site_count"], done["counts"]["stored"]),
+                         (174, 174, 174))
+        self.assertFalse(any("may have been cut short" in w for w in done["warnings"]), done["warnings"])
+        self.assertTrue(any("listed again over b.example:2" in w for w in done["warnings"]), done["warnings"])
+
+    # ---- issue 14: the site's count, apart from what was listed ---------------------------------
+
+    def test_a_capped_pull_says_how_big_the_playlist_is_and_what_the_cap_left_out(self):
+        import server as server_mod
+        self.playlist_by_route({"direct": (174, 174)})
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 50, "details": False})
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(self.listed_over, ["direct"])                          # a capped listing is not "short"
+        c = pull.read_job(done["id"])["counts"]
+        self.assertEqual((c["listed"], c["site_count"], c["selected"], c["stored"]), (70, 174, 50, 50))
+        view = server_mod._job_view(pull.read_job(done["id"]))
+        self.assertIn("the playlist has 174; 124 not tried because of max_videos=50", view["message"])
+        self.assertEqual(view["counts"]["site_count"], 174)
+        self.playlist_by_route({"direct": (40, None)})                            # the site gave no count
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLzyxwvut98765", "max_videos": 10, "details": False})
+        self.assertIsNone(done["counts"]["site_count"])
+        self.assertIn("at least 20 more not tried because of max_videos=10", done["message"])
+
+    # ---- issue 15: refusals that did not take a route out ---------------------------------------
+
+    def test_scattered_refusals_are_reported_by_route(self):
+        import server as server_mod
+        os.environ["PROXY_URLS"] = "http://u:pw88888@a.example:10001,http://b.example:2"
+        calls = {"a": 0}
+
+        def fetcher(vid, langs, proxy):
+            if "a.example" in proxy:
+                calls["a"] += 1
+                if calls["a"] in (1, 3, 6, 9) or calls["a"] >= 12:   # 4 scattered, then a run that takes it out
+                    raise self.RequestBlocked()
+            return self.ok()
+
+        done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 1, "details": False,
+                            "max_videos": 0}, lister=PullTests.lister([f"{i:011d}" for i in range(30)]),
+                           fetcher=fetcher)
+        self.assertEqual((done["state"], done["routes_out"]), ("done", ["a.example:10001"]))
+        self.assertEqual(done["refusals_by_route"], {"a.example:10001": 4})        # the run of 5 is not counted
+        self.assertIn("a.example:10001 refused 4 requests that did not take it out", done["message"])
+        self.assertNotIn("pw88888", json.dumps(done))
+        self.assertEqual(server_mod._job_view(pull.read_job(done["id"]))["refusals_by_route"], {"a.example:10001": 4})
+
+        os.environ["PROXY_URLS"] = "http://us.example:10001"
+        n = {"i": 0}
+
+        def scattered(vid, langs, proxy):
+            n["i"] += 1
+            if n["i"] % 3 == 0:
+                raise self.RequestBlocked()
+            return self.ok()
+
+        ids = [f"x{i:010d}" for i in range(12)]
+        done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "details": False, "max_videos": 0},
+                           lister=PullTests.lister(ids), fetcher=scattered)
+        self.assertEqual(done["state"], "done")
+        self.assertIn("us.example:10001 refused 4 requests that did not take it out", done["message"])
+        self.assertEqual(done["counts"]["failed"], 4)
+
+    # ---- issue 16: one request limit for all the workers ----------------------------------------
+
+    def test_four_workers_never_send_more_than_the_limit_in_any_minute_whatever_the_delay(self):
+        import threading
+        import server as server_mod
+        os.environ["PROXY_URLS"] = ",".join(f"http://r{i}.example:{i}" for i in range(1, 5))
+        for delay_ms, details in ((500, False), (8000, True), (500, True)):
+            vt = VirtualTime()
+            sent, guard = [], threading.Lock()
+
+            def record(kind):
+                with guard:
+                    sent.append((vt.clock(), kind))
+
+            def lister(job, proxy):
+                record("list")
+                return PullTests.lister([f"{i:011d}" for i in range(40)])(job, proxy)
+
+            def fetcher(vid, langs, proxy):
+                record("transcript")
+                if vid.endswith("7"):
+                    raise ConnectionError("down")          # retried: every attempt is a request
+                return self.ok()
+
+            def detailer(vid, proxy):
+                record("page")
+                return {"upload_date": "20250102", "view_count": 9}
+
+            done, printed = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 4, "max_videos": 0,
+                                      "details": details, "delay_ms": delay_ms, "refresh": True,
+                                      "max_requests_per_minute": 10},
+                                     lister=lister, fetcher=fetcher, detailer=detailer, sleep=vt.sleep, clock=vt.clock)
+            self.assertEqual((done["state"], done["workers"], done["max_requests_per_minute"]), ("done", 4, 10))
+            self.assertEqual(len({u for u, _ in sent}), len(sent))
+            self.assertLessEqual(most_in_a_minute([u for u, _ in sent]), 10, (delay_ms, details))
+            self.assertEqual(most_in_a_minute([u for u, _ in sent]), 10)        # and the limit is used, not idle
+            self.assertEqual(done["requests"], len(sent))
+            self.assertEqual(done["counts"]["stored"], 36)
+            self.assertEqual(sum(1 for _, k in sent if k == "transcript"), 36 + 4 * 3)
+            self.assertIn("at most 10 requests a minute", printed)
+            view = server_mod._job_view(pull.read_job(done["id"]))
+            self.assertEqual((view["request_limit_per_minute"], view["requests"]), (10, len(sent)))
+            self.assertIn("requests_per_minute", view)
+
+    def test_the_request_limit_spaces_requests_by_its_own_clock(self):
+        now = {"t": 100.0}
+        waits = []
+        rate = pull.RequestLimit(10, clock=lambda: now["t"],
+                                 sleep=lambda s: (waits.append(s), now.__setitem__("t", now["t"] + s + 0.7)))
+        times = []
+        for _ in range(25):
+            rate.take()
+            times.append(now["t"])
+        self.assertEqual(rate.count, 25)
+        self.assertLessEqual(most_in_a_minute(times), 10)
+        self.assertTrue(all(b - a >= 6.0 for a, b in zip(times, times[1:])))   # a late wake-up brings none closer
+        self.assertTrue(all(w <= pull.RequestLimit.LONGEST_NAP_S for w in waits))
+        free = pull.RequestLimit(None, clock=lambda: 0.0, sleep=lambda s: self.fail("no limit: nothing waits"))
+        for _ in range(1000):
+            free.take()
+        self.assertEqual(free.count, 1000)
+        stopping = pull.RequestLimit(1, clock=lambda: now["t"], sleep=lambda s: None)
+        stopping.take()
+        with self.assertRaises(pull._Halted):
+            stopping.take(lambda: True)
+
+    def test_a_stop_is_seen_while_a_worker_waits_for_its_turn(self):
+        vt = VirtualTime()
+        asked, naps = [], []
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert", "details": False,
+                              "max_requests_per_minute": 1})
+        pull.write_job(job)
+
+        def sleep(seconds):                    # the stop request arrives during the first wait for a turn
+            naps.append(seconds)
+            (pull.jobs_dir() / f"{job['id']}.stop").write_text("stop")
+            vt.sleep(seconds)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = pull.run_job(job["id"], lister=PullTests.lister([f"{i:011d}" for i in range(10)]),
+                                fetcher=lambda vid, *a: asked.append(vid) or self.ok(), detailer=None,
+                                sleep=sleep, clock=vt.clock)
+        self.assertEqual((done["state"], asked, done["requests"]), ("stopped", [], 1))   # the listing only
+        self.assertEqual(naps, [pull.RequestLimit.LONGEST_NAP_S])               # it looked again after one nap
+
+    def test_the_pause_has_jitter_on_top_and_never_goes_under_the_floor(self):
+        self.assertEqual(pull.jittered(1500, rand=lambda: 0.0), 1.5)
+        self.assertEqual(pull.jittered(1500, rand=lambda: 1.0), 2.25)
+        self.assertEqual(pull.jittered(10, rand=lambda: 0.0), config.MIN_DELAY_MS / 1000.0)   # an edited record
+        got = {pull.jittered(1500) for _ in range(50)}
+        self.assertGreater(len(got), 1)
+        self.assertTrue(all(1.5 <= g <= 2.25 for g in got))
+        sleeps = []
+        done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "details": False, "delay_ms": 3000},
+                           lister=PullTests.lister([VID_A, VID_B, VID_C]), sleep=sleeps.append,
+                           rand=lambda: 0.5)
+        self.assertEqual(sleeps, [3.75, 3.75])
+
+    def test_the_limit_comes_from_the_settings_or_the_pull_and_is_bounded(self):
+        import server as server_mod
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert"})
+        self.assertIsNone(job["max_requests_per_minute"])                       # off by default
+        self.assertEqual(server_mod.t_setup_check({})["pull_defaults"]["max_requests_per_minute"], "off")
+        os.environ["EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE"] = "6"
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert"})
+        self.assertEqual((job["max_requests_per_minute"], job["rate_from"]["max_requests_per_minute"]), (6, "settings"))
+        job = pull.build_job({"kind": "channel", "target": "@SomeExpert", "max_requests_per_minute": 20})
+        self.assertEqual((job["max_requests_per_minute"], job["rate_from"]["max_requests_per_minute"]), (20, "pull"))
+        got = server_mod.t_setup_check({})
+        self.assertEqual(got["pull_defaults"]["max_requests_per_minute"], 6)
+        self.assertEqual(got["pull_defaults"]["from"]["max_requests_per_minute"], "EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE")
+        for bad in (-3, 601, -0.5):
+            with self.assertRaises(pull.PullError, msg=bad):
+                pull.build_job({"kind": "channel", "target": "@SomeExpert", "max_requests_per_minute": bad})
+        for bad in ("six", "0", "601", "1.5"):
+            os.environ["EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE"] = bad
+            with self.assertRaises(ValueError, msg=bad):
+                pull.build_job({"kind": "channel", "target": "@SomeExpert"})
+            got = server_mod.t_setup_check({})
+            self.assertTrue(any(p.startswith("pull defaults") for p in got["problems"]), bad)
+            self.assertFalse(got["can_pull"])
+        os.environ["EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE"] = "600"
+        self.assertEqual(pull.build_job({"kind": "channel", "target": "@SomeExpert"})["max_requests_per_minute"], 600)
+        # pull_resume keeps a limit the earlier pull was given, and otherwise takes the settings then
+        real, real_need = pull.create_job, server_mod._need_pull_packages
+        self.addCleanup(setattr, pull, "create_job", real)
+        self.addCleanup(setattr, server_mod, "_need_pull_packages", real_need)
+        pull.create_job, server_mod._need_pull_packages = pull.build_job, lambda: None
+        given = pull.build_job({"kind": "channel", "target": "@SomeExpert", "max_requests_per_minute": 12})
+        plain = pull.build_job({"kind": "channel", "target": "@SomeExpert"})
+        for j in (given, plain):
+            j["state"] = "blocked"
+            pull.write_job(j)
+        os.environ["EXPERTISE_MINER_MAX_REQUESTS_PER_MINUTE"] = "5"
+        self.assertEqual(server_mod.t_pull_resume({"job_id": given["id"]})["request_limit_per_minute"], 12)
+        self.assertEqual(server_mod.t_pull_resume({"job_id": plain["id"]})["request_limit_per_minute"], 5)
 
 
 class MineTests(Base):
