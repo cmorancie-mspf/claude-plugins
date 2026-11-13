@@ -12,6 +12,7 @@ A Claude Code plugin marketplace named `production-ai`. Each top-level folder wi
 |---|---|---|
 | `rebuild-factory` | Audits an existing codebase, plans a rebuild, and runs it as a loop in which a separate coding agent builds and every session is reviewed from a clean clone | `rebuild-factory/README.md`, then `rebuild-factory/references/` |
 | `transcribe` | Local speech-to-text for a file or a URL | `transcribe/README.md` |
+| `change-factory` | Runs a list of changes to a working system as parallel workstreams built by OpenCode workers, reviewed, tested, merged and red-teamed, with deploys and owner decisions left to the owner | `change-factory/README.md`, then `change-factory/references/method.md` |
 | `expertise-miner` | Pulls YouTube transcripts into a searchable corpus and mines them for an expert's questions, rules of thumb and research steps, with every quote checked against the transcript | `expertise-miner/README.md`, then `expertise-miner/server/` |
 
 If you were asked to **install** a plugin for someone, read `INSTALL.md`. If you were asked to **use** one, read `llms.txt` and that plugin's README. The rest of this file is for changing the repository.

@@ -21,6 +21,11 @@
       "name": "expertise-miner",
       "source": "./expertise-miner",
       "description": "Pull the transcripts of a YouTube channel, playlist or video into a searchable local corpus, then mine them for an expert's research questions, rules of thumb and research steps. Every mined item carries a quote checked word for word against the stored transcript, the video, the timestamp and a way to test it against data. Slow and polite by default; SQLite storage, with MongoDB and a proxy as optional settings. Ships an MCP server, three skills and a file-only reader agent."
+    },
+    {
+      "name": "change-factory",
+      "source": "./change-factory",
+      "description": "Run an owner's list of fixes and features on a working system as parallel workstreams: briefs by subagents, cheap OpenCode workers started under deny rules, reviews on another model, tests on the exact reviewed commit, merges onto one integration branch, one red team per risky stream on its merge commit, then per-unit deploy asks with the rollback named first. A helper script is the only writer of the run's event log and refuses illegal steps; a hook guards deploys, pushes, moves of main and owner records, which by default are accepted only when the owner types yes in their own terminal. The workers' rules match command text and are not a sandbox."
     }
   ]
 }

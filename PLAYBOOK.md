@@ -36,7 +36,7 @@ change "looks small"; most of the defects below were in small, confident steps.
 | 9 | **Same reviewer re-checks** | The reviewer re-runs its proof scripts against the fixes and approves, or names new musts | A fresh reviewer re-learns everything and checks less |
 | 10 | **Owner's hands-on checks** | The owner tries, by hand, what no test can reach (an interactive prompt, typing `yes` in a terminal), and the README records what was tried and on what | A test cannot pretend to be a terminal without adding a way round the check |
 | 11 | **Commit** | One plugin per commit (a `core/` change is the one exception: section 6), version bumped, message says what was tested and what was not, and who reviewed | Each release can be traced to its review |
-| 12 | **List it** | Only then add it to `.claude-plugin/marketplace.json`. A method plugin (one drawn from a single real run) waits for a second real run as well | A method drawn from one project is shaped by that project in ways only a second one shows |
+| 12 | **List it** | Only then add it to `.claude-plugin/marketplace.json`. The owner may hold a method plugin (one drawn from a single real run) back for a second real run | A method drawn from one project is shaped by that project in ways only a second one shows; say in its README how many real runs it has had |
 
 Plans, red teams, fixes files, spike notes and proof scripts never enter this repository: they hold the real
 run, the machine and the findings. Keep them in a folder of your own outside it.
@@ -46,10 +46,7 @@ yet reviewed for release" (or "awaiting a second real run"). Anyone can try it w
 `claude --plugin-dir <folder>`; that is also how the owner makes a second real run. Such a run is the owner's,
 on a real project, and outside the no-spend rule for tests.
 
-**Open owner decision.** The second real run in step 12 is not yet a repository rule: `AGENTS.md` rule 4 requires
-an approving review only, and rebuild-factory was listed after one run. The owner chooses: (a) add it to
-`AGENTS.md` rule 4 for new method plugins, noting that rebuild-factory predates it; or (b) reword step 12 as "the
-owner may hold a method plugin back for a second real run". Until then step 12 stands as written.
+**Owner decision.** A second real run is not required before listing: `AGENTS.md` rule 4 (an approving independent review) is the gate. The owner may still hold a method plugin back for a second real run, and its README then says how many real runs it has had.
 
 ### Scope: which parts apply to your plugin
 
@@ -342,5 +339,5 @@ Then confirm by reading (skip a line your plugin's scope row does not require):
 - [ ] `version` bumped in every plugin whose behaviour changed, including every carrier of a changed `core/` part.
 - [ ] Old wording searched for and changed in every document.
 - [ ] One plugin in this commit (or one `core:` commit, section 6); the message has Tested, Not tested and the reviewer.
-- [ ] For a new plugin: its entry in `marketplace.json` only after approval (and a second real run for a method plugin: see the open owner decision in section 1); a row in `README.md`; lines in `llms.txt`, the `AGENTS.md` table and `INSTALL.md`.
+- [ ] For a new plugin: its entry in `marketplace.json` only after approval (a second real run only if the owner holds it back: section 1); a row in `README.md`; lines in `llms.txt`, the `AGENTS.md` table and `INSTALL.md`.
 - [ ] Nothing pushed or published without the owner's yes.
