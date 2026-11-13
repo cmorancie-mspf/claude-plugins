@@ -97,11 +97,11 @@ Requires Node 18 or later and Python 3.9 or later. Pulling needs two Python pack
   skills/  agents/  ...
 ```
 
-To add a plugin: put its folder at the top level, add an entry to `marketplace.json` with `"source": "./<folder>"`, and add a row to the table above. Run `claude plugin validate .` and `node .github/check.mjs` before committing.
+To add a plugin, follow [PLAYBOOK.md](PLAYBOOK.md): a plugin is listed in `marketplace.json` only after an independent review has approved it, and the commands to run before a commit are in [AGENTS.md](AGENTS.md#before-you-commit).
 
 ## Contributing
 
-Reports of what did not work on your codebase are the most useful contribution. See [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md) for reporting a security problem. Never put a real project's findings, plans or data into this repository.
+To write or change a plugin, follow [PLAYBOOK.md](PLAYBOOK.md). Reports of what did not work on your codebase are the most useful contribution. See [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md) for reporting a security problem. Never put a real project's findings, plans or data into this repository.
 
 ## Licence
 

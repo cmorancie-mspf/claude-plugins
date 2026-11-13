@@ -21,6 +21,7 @@ Things an agent should know before acting on anything here:
 - [Repository README](https://raw.githubusercontent.com/production-ai-eng/claude-plugins/main/README.md): the plugins, how to install, the warning to read before running.
 - [INSTALL.md](https://raw.githubusercontent.com/production-ai-eng/claude-plugins/main/INSTALL.md): for an agent asked to install a plugin for someone: what to say first, the commands, what to check, what only the person can do, how to confirm it worked.
 - [AGENTS.md](https://raw.githubusercontent.com/production-ai-eng/claude-plugins/main/AGENTS.md): rules for an agent changing this repository, and the checks to run.
+- [PLAYBOOK.md](https://raw.githubusercontent.com/production-ai-eng/claude-plugins/main/PLAYBOOK.md): for writing or changing a plugin: the steps from idea to release, which apply to which kind of plugin, and the rules with why.
 - [SECURITY.md](https://raw.githubusercontent.com/production-ai-eng/claude-plugins/main/SECURITY.md): what each protection does and does not stop; how to report a problem.
 
 ## rebuild-factory
