@@ -643,7 +643,7 @@ let bh;
 try { bh = execFileSync(process.execPath, [path.join(broken, 'hook.mjs'), 'hook'], { env: ENV, encoding: 'utf8', input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }), stdio: ['pipe', 'pipe', 'pipe'] }); } catch (e) { bh = 'exit ' + e.status + ' ' + String(e.stderr || ''); }
 ok('B-L18 the hook asks when the helper cannot load (a missing lib or bridge file)', /"permissionDecision":\s*"ask"/.test(bh), bh);
 const mj = JSON.parse(fs.readFileSync(path.join(P, '.mcp.json'), 'utf8'));
-ok('Q-M3 the plugin\'s bridge server offers no start tool (the helper starts workers)', /status/.test(mj.mcpServers?.['oc-bridge']?.env?.OC_BRIDGE_TOOLS || '') && !/start/.test(mj.mcpServers?.['oc-bridge']?.env?.OC_BRIDGE_TOOLS || ''), JSON.stringify(mj));
+ok('0.1.1 the plugin\'s bridge server offers every tool, start included, for workers started by hand outside a run (inside a run the helper does not count a run without the trusted rules: Q-M3 above)', !mj.mcpServers?.['oc-bridge']?.env?.OC_BRIDGE_TOOLS, JSON.stringify(mj));
 
 // SessionStart: a compacted or resumed chat is told the run is open
 r = sh(['session-start'], { input: JSON.stringify({ cwd: repo, source: 'compact' }) });

@@ -45,7 +45,7 @@ Say them plainly; do not bury them.
 - It starts OpenCode workers whose commands are auto-approved, on this machine, in worktrees of the person's repository. Their deny rules match command text; they are not a sandbox. Run it where workers cannot reach production credentials if possible.
 - It installs a hook in every Claude Code session. Outside a project with a `change-factory.config.json` it leaves commands alone, except that it asks before the helper's own owner commands.
 - By default its owner records (accepting the config, opening a run, waivers, budgets) are refused from any chat and accepted only when the person types `yes` in their own terminal. Deploys, pushes and moves of main are theirs too.
-- It registers an MCP server, `oc-bridge`, offering status, stop and list only.
+- It registers an MCP server, `oc-bridge`, with every tool, start included, for workers started by hand; inside a run only the helper's own starts are counted.
 - Its records are kept in the person's home folder (`~/.change-factory`).
 
 Install only after the person has heard this and still wants it.

@@ -2,8 +2,9 @@
   "mcpServers": {
     "oc-bridge": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/bridge/mcp.mjs"],
-      "env": { "OC_BRIDGE_TOOLS": "status,stop,list" }
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bridge/mcp.mjs"
+      ]
     }
   }
 }
