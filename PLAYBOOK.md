@@ -96,8 +96,9 @@ In a Claude Code plugin, only these can stop something. Anything else is text in
 
 A gate in the helper means nothing if the conductor still does the thing itself. If the helper records a dispatch
 while the conductor starts the worker with rules of its own choosing, the gate is decoration. Fix: the helper
-starts the worker itself, with the trusted rules, and the plugin's MCP server offers no start tool at all
-(`OC_BRIDGE_TOOLS` in `change-factory/.mcp.json`).
+starts the worker itself, with the trusted rules, and refuses the result of any run it did not start that way.
+Hiding the start tool (`OC_BRIDGE_TOOLS`) protects little when another plugin offers one; the check on the result
+is what holds.
 
 ### Rules that follow from that
 

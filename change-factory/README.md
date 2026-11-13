@@ -25,7 +25,7 @@ It is for a system that works and has users, where a change that is wrong costs 
   tests itself and reads their results; the conductor (the Claude Code chat) never types a result the helper
   can read. It refuses any step whose gate is not met.
 - **Workers** are OpenCode runs started by the helper through the bundled bridge, with the trusted rules, a
-  per-provider cap and the environment scrub. The plugin's bridge server offers status, stop and list only.
+  per-provider cap and the environment scrub. The plugin's bridge server also offers every tool, start included, for workers you start by hand outside a run; inside a run the helper does not count a worker that it did not start with the trusted rules.
 - **Reviewers, red teams, brief writers and the research analyst** are subagents with no shell.
 - **The guard hook** puts every configured deploy, every push, every move of the main branch and every owner
   record in front of the person at the keyboard.
