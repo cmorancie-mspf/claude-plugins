@@ -1,0 +1,18 @@
+{
+  "name": "change-factory",
+  "description": "Run a list of changes to a working system as parallel workstreams: owner decisions, briefs, cheap coding workers in rounds, independent reviews, merges onto one integration branch, one red team per risky stream on the merged code, and a release in which every deploy, push and owner record is the owner's own yes. A helper script keeps the run's event log and refuses steps whose gates are not met; workers run auto-approved under deny rules that are not a sandbox.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Chris Morancie"
+  },
+  "license": "MIT",
+  "keywords": [
+    "orchestration",
+    "workstreams",
+    "red-team",
+    "review",
+    "opencode",
+    "release"
+  ],
+  "repository": "https://github.com/production-ai-eng/claude-plugins"
+}
