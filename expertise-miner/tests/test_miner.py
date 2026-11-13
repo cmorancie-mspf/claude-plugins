@@ -943,7 +943,7 @@ class FieldReportTests(Base):
                                 fetcher=fetcher, detailer=None, sleep=lambda s: None)
         self.assertEqual(done["routes_out"], ["a.example:1"])
         self.assertIn("a.example:1", pull.cooling_routes())           # four site refusals: cooled, whatever came last
-        self.assertIn("a.example:1 (RequestBlocked)", done["message"])
+        self.assertIn("a.example:1 (RequestBlocked; 5 videos in a row got no answer over it)", done["message"])
         self.assertIn("pull_resume tries them again", done["message"])
 
     def test_words_that_only_look_like_a_proxy_failure_do_not_blame_it(self):
@@ -1231,8 +1231,9 @@ class Phase2Tests(Base):
                                 **({"lister": lister} if lister else {}), **{"sleep": lambda s: None, **kw})
         return done, printed.getvalue()
 
-    def playlist_by_route(self, by_route, errors=()):
-        """yt-dlp replaced: the listing over a route whose name holds a key of by_route returns
+    def playlist_by_route(self, by_route, errors=(), warnings=()):
+        """yt-dlp replaced: warnings are passed to its logger on every listing (a dict of them by route
+        key: only over that route). The listing over a route whose name holds a key of by_route returns
         (entries, playlist_count) for it, or (entries, playlist_count, first id number); for a
         channel, a dict of those by tab. Records the routes listed over in self.listed_over."""
         test = self
@@ -1252,6 +1253,10 @@ class Phase2Tests(Base):
                 test.listed_over.append(config.mask_proxy(self.proxy))
                 for e in errors:
                     self.logger.error(e)
+                lines = (next((v for k, v in warnings.items() if k in (self.proxy or "direct")), [])
+                         if isinstance(warnings, dict) else warnings)
+                for w in lines:
+                    self.logger.warning(w)
                 got = next(v for k, v in by_route.items() if k in (self.proxy or "direct"))
                 tab = url.rsplit("/", 1)[-1]
                 if isinstance(got, dict):
@@ -1286,7 +1291,7 @@ class Phase2Tests(Base):
         self.assertEqual((done["workers"], done["state"]), (1, "done"))
         self.assertEqual(done["routes_out"], ["a.example:1"])
         self.assertEqual(used[:pull.BLOCK_STREAK], ["a.example:1"] * pull.BLOCK_STREAK)
-        self.assertEqual(set(used[pull.BLOCK_STREAK:]), {"b.example:2"})          # route 2 finished the pull
+        self.assertEqual(set(used[pull.BLOCK_STREAK:]), {"b.example:2"})                  # route 2 finished the pull
         self.assertEqual(done["counts"]["stored"], 20 - pull.BLOCK_STREAK)
         self.assertIn("route a.example:1 taken out", printed)                    # the log names the switch
         self.assertIn("b.example:2 takes over", printed)
@@ -1368,7 +1373,8 @@ class Phase2Tests(Base):
         def fetcher(vid, langs, proxy):
             if "a.example" in proxy:
                 calls["a"] += 1
-                if calls["a"] in (1, 3, 6, 9) or calls["a"] >= 12:   # 4 scattered, then a run that takes it out
+                # 2 scattered, then 3 in a row: at call 12, 4 of its last 10 (6, 10, 11, 12) take it out
+                if calls["a"] in (1, 6) or calls["a"] >= 10:
                     raise self.RequestBlocked()
             return self.ok()
 
@@ -1376,22 +1382,25 @@ class Phase2Tests(Base):
                             "max_videos": 0}, lister=PullTests.lister([f"{i:011d}" for i in range(30)]),
                            fetcher=fetcher)
         self.assertEqual((done["state"], done["routes_out"]), ("done", ["a.example:10001"]))
-        self.assertEqual(done["refusals_by_route"], {"a.example:10001": 4})        # the run of 5 is not counted
-        self.assertIn("over a.example:10001, 4 videos got no answer from the site without the route being taken out",
+        self.assertEqual(calls["a"], 12)
+        self.assertEqual(done["routes_out_why"], {"a.example:10001": "refused 4 of its last 10 (RequestBlocked)"})
+        # call 1 had left the window: it did not take the route out. The four in the window did
+        self.assertEqual(done["refusals_by_route"], {"a.example:10001": 1})
+        self.assertIn("over a.example:10001, 1 video got no answer from the site without the route being taken out",
                       done["message"])
         self.assertNotIn("pw88888", json.dumps(done))
-        self.assertEqual(server_mod._job_view(pull.read_job(done["id"]))["refusals_by_route"], {"a.example:10001": 4})
+        self.assertEqual(server_mod._job_view(pull.read_job(done["id"]))["refusals_by_route"], {"a.example:10001": 1})
 
         os.environ["PROXY_URLS"] = "http://us.example:10001"
         n = {"i": 0}
 
         def scattered(vid, langs, proxy):
             n["i"] += 1
-            if n["i"] % 3 == 0:
+            if n["i"] % 4 == 0:            # never more than 3 of any 10 in a row: under the share rule
                 raise self.RequestBlocked()
             return self.ok()
 
-        ids = [f"x{i:010d}" for i in range(12)]
+        ids = [f"x{i:010d}" for i in range(16)]
         done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "details": False, "max_videos": 0},
                            lister=PullTests.lister(ids), fetcher=scattered)
         self.assertEqual(done["state"], "done")
@@ -1653,17 +1662,17 @@ class Phase2Tests(Base):
         class ProxyError(Exception):
             pass
 
-        ids = [f"{i:011d}" for i in range(8)]
+        ids = [f"{i:011d}" for i in range(14)]      # three failures, 5 apart: never 3 in a window of 10
         st = self.open()
         real_has = st.has_video
-        st.has_video = lambda vid: (_ for _ in ()).throw(RuntimeError("disk")) if vid == ids[2] else real_has(vid)
+        st.has_video = lambda vid: (_ for _ in ()).throw(RuntimeError("disk")) if vid == ids[5] else real_has(vid)
         os.environ["PROXY_URLS"] = "http://p.example:1"
         calls = {"n": 0}
 
         def fetcher(vid, langs, proxy):
             if vid == ids[0]:
                 raise ProxyError("Unable to connect to proxy: Tunnel connection failed: 502")
-            if vid == ids[4]:
+            if vid == ids[10]:
                 raise self.RequestBlocked()
             return self.ok()
 
@@ -1726,6 +1735,309 @@ class Phase2Tests(Base):
         for state, code in (("done", 0), ("partial", 4), ("blocked", 2), ("stopped", 1), ("failed", 1)):
             pull.run_job = lambda jid, s=state: {"state": s}
             self.assertEqual(pull.main(["pull.py", "run", "abcd1234"]), code, state)
+
+
+class Phase3Tests(Base):
+    """0.3.4: issues 16 to 18 of the field report's phase 3 (P3-16, P3-17, P3-18), and the Deno sentence."""
+
+    def tearDown(self):
+        import server as server_mod
+        if server_mod._store is not None:
+            server_mod._store.close()
+            server_mod._store = None
+        super().tearDown()
+
+    RequestBlocked = Phase2Tests.RequestBlocked
+    ok = staticmethod(Phase2Tests.ok)
+    pull_with = Phase2Tests.pull_with
+    playlist_by_route = Phase2Tests.playlist_by_route
+    HIDDEN = "[youtube:tab] YouTube said: INFO - 27 unavailable videos are hidden"
+
+    # ---- P3-16: a route that refuses part of the time ------------------------------------------
+
+    def test_the_share_rule_counts_a_routes_last_ten_videos(self):
+        x, o = True, False
+        self.assertEqual(pull.take_out_rule([o, o, x] * 3), "refused 3 of its last 9")
+        self.assertEqual(pull.take_out_rule([o, o, x] * 2), "")                    # 2 is never enough
+        self.assertEqual(pull.take_out_rule([x, x, x]), "")                       # nothing answered: the streak
+        self.assertEqual(pull.take_out_rule([x] * 4), "")                         # judges it alone
+        self.assertEqual(pull.take_out_rule([x] * 5), "5 videos in a row got no answer over it")
+        self.assertEqual(pull.take_out_rule([o] + [x] * 3), "refused 3 of its last 4")
+        self.assertEqual(pull.take_out_rule([o] * 7 + [x] * 3), "")                # 3 of 10 is 30%: not more
+        self.assertEqual(pull.take_out_rule([o] * 6 + [x] * 4), "refused 4 of its last 10")
+        self.assertEqual(pull.take_out_rule([x] * 3 + [o] * 10), "")              # only the last 10 count
+        self.assertEqual((pull.RATE_WINDOW, pull.RATE_MIN, pull.RATE_SHARE, pull.BLOCK_STREAK, pull.ROTATE_EVERY),
+                         (10, 3, 0.3, 5, 20))
+
+    def test_a_route_that_refuses_every_third_request_is_taken_out_and_route_two_finishes(self):
+        # the report's acceptance check
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2,http://c.example:3"
+        used = []
+
+        def fetcher(vid, langs, proxy):
+            used.append(config.mask_proxy(proxy))
+            if "a.example" in proxy and used.count("a.example:1") % 3 == 0:
+                raise self.RequestBlocked()
+            return self.ok()
+
+        done, printed = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 1, "details": False,
+                                        "max_videos": 0}, lister=PullTests.lister([f"{i:011d}" for i in range(25)]),
+                                       fetcher=fetcher)
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(done["routes_out"], ["a.example:1"])
+        n = used.count("a.example:1")
+        self.assertLessEqual(n, 10)                                             # within its first 10 requests
+        self.assertEqual(n, 9)
+        self.assertEqual(used[:n], ["a.example:1"] * n)
+        self.assertEqual(set(used[n:]), {"b.example:2"})                        # route 2 finished the pull
+        self.assertEqual(done["counts"]["stored"], 25 - 3)
+        self.assertIn("route a.example:1 taken out: refused 3 of its last 9 (RequestBlocked); b.example:2 takes over",
+                      printed)
+        self.assertEqual(done["routes_out_why"], {"a.example:1": "refused 3 of its last 9 (RequestBlocked)"})
+        self.assertIn("a.example:1", pull.cooling_routes())                    # cooled, as after a run
+        self.assertEqual(done["refusals_by_route"], {})                         # the three took it out
+
+    def test_four_refusals_in_a_row_with_nothing_answered_leave_a_route_in_and_the_fifth_takes_it_out(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        used = []
+
+        def fetcher(vid, langs, proxy):
+            used.append(config.mask_proxy(proxy))
+            if "a.example" in proxy:
+                raise self.RequestBlocked()
+            return self.ok()
+
+        for n_ids, state, out in ((4, "done", []), (12, "done", ["a.example:1"])):
+            used.clear()
+            done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 1, "details": False,
+                                      "max_videos": 0},
+                                     lister=PullTests.lister([f"r{n_ids}{i:08d}x" for i in range(n_ids)]),
+                                     fetcher=fetcher)
+            self.assertEqual((done["state"], done["routes_out"]), (state, out), n_ids)
+        # 4 videos, all refused, and none answered: still in (the streak is 5), and they are counted
+        # 12 videos: out on the 5th, b finishes
+        self.assertEqual(used[:5], ["a.example:1"] * 5)
+        self.assertEqual(set(used[5:]), {"b.example:2"})
+        self.assertEqual(done["routes_out_why"], {"a.example:1": "5 videos in a row got no answer over it (RequestBlocked)"})
+
+    def test_with_no_proxy_a_pull_still_ends_blocked_after_five(self):
+        used = []
+
+        def fetcher(vid, langs, proxy):
+            used.append(vid)
+            raise self.RequestBlocked()
+
+        done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "details": False, "max_videos": 0},
+                                 lister=PullTests.lister([f"{i:011d}" for i in range(20)]), fetcher=fetcher)
+        self.assertEqual((done["state"], len(used), done["counts"]["failed"]), ("blocked", 5, 5))
+        self.assertIn("5 videos in a row got no answer over it", done["message"])
+
+    def test_a_route_out_by_the_share_rule_is_not_cooled_when_only_the_proxy_failed(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        n = {"a": 0}
+
+        class ProxyError(Exception):
+            pass
+
+        def fetcher(vid, langs, proxy):
+            if "a.example" in proxy:
+                n["a"] += 1
+                if n["a"] % 3 == 0:
+                    raise ProxyError("Unable to connect to proxy: Tunnel connection failed: 502")
+            return self.ok()
+
+        done, printed = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 1, "details": False,
+                                        "max_videos": 0}, lister=PullTests.lister([f"{i:011d}" for i in range(15)]),
+                                       fetcher=fetcher)
+        self.assertEqual((done["state"], done["routes_out"]), ("done", ["a.example:1"]))
+        self.assertIn("the proxy itself failed (refused 3 of its last 9: ProxyUnreachable); the site was not asked",
+                      printed)
+        self.assertEqual(pull.cooling_routes(), {})
+
+    def test_with_routes_standing_by_one_worker_rotates_every_twenty_videos(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2,http://c.example:3"
+        used = []
+        live, top = set(), {"two": False}
+        guard = __import__("threading").Lock()
+
+        def fetcher(vid, langs, proxy):
+            r = config.mask_proxy(proxy)
+            with guard:
+                top["two"] = top["two"] or r in live
+                live.add(r)
+                used.append(r)
+            time.sleep(0.001)
+            with guard:
+                live.discard(r)
+            return self.ok()
+
+        done, printed = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 1, "details": False,
+                                        "max_videos": 0}, lister=PullTests.lister([f"{i:011d}" for i in range(60)]),
+                                       fetcher=fetcher)
+        self.assertEqual((done["state"], done["counts"]["stored"]), ("done", 60))
+        self.assertEqual(set(used), {"a.example:1", "b.example:2", "c.example:3"})   # all three were used
+        self.assertEqual(used, ["a.example:1"] * 20 + ["b.example:2"] * 20 + ["c.example:3"] * 20)
+        self.assertFalse(top["two"])                                                # never two at once
+        self.assertIn("route a.example:1 handed back after 20 videos; b.example:2 takes over", printed)
+
+        # two workers over three routes: every route used, none ever by two workers at once
+        used.clear()
+        done, _ = self.pull_with({"kind": "channel", "target": "@OtherExpert", "workers": 2, "details": False,
+                                  "max_videos": 0}, lister=PullTests.lister([f"y{i:010d}" for i in range(80)]),
+                                 fetcher=fetcher)
+        self.assertEqual((done["state"], done["counts"]["stored"]), ("done", 80))
+        self.assertEqual(set(used), {"a.example:1", "b.example:2", "c.example:3"})
+        self.assertFalse(top["two"])
+        self.assertEqual(done["routes_out"], [])
+
+    def test_videos_already_stored_do_not_count_towards_a_rotation_and_a_cooling_route_is_skipped(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2,http://c.example:3"
+        ids = [f"{i:011d}" for i in range(40)]
+        st = self.open()
+        for vid in ids[:10]:
+            st.upsert_video(self.video(vid))
+        st.close()
+        used = []
+
+        def fetcher(vid, langs, proxy):
+            used.append(config.mask_proxy(proxy))
+            if len(used) == 1:
+                pull.cool_down("b.example:2")      # b starts cooling while the pull runs: never taken
+            return self.ok()
+
+        done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 1, "details": False,
+                                  "max_videos": 0}, lister=PullTests.lister(ids), fetcher=fetcher)
+        self.assertEqual((done["counts"]["skipped_existing"], done["counts"]["stored"]), (10, 30))
+        self.assertEqual(used, ["a.example:1"] * 20 + ["c.example:3"] * 10)     # 20 sent, not 20 handled
+
+    # ---- P3-17: an empty listing ------------------------------------------------------------------
+
+    def test_an_empty_listing_with_a_count_and_hidden_videos_ends_partial(self):
+        # the report's acceptance check
+        import server as server_mod
+        from unittest import mock
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2,http://c.example:3"
+        self.playlist_by_route({"example": (0, 27)}, warnings=[self.HIDDEN])
+        with mock.patch.object(pull.shutil, "which", lambda name: "/usr/bin/deno"):
+            done, printed = self.pull_with({"kind": "playlist", "target": "PLAWpN9gkcLIIxx", "max_videos": 0,
+                                            "details": False})
+        self.assertEqual(done["state"], "partial")
+        self.assertEqual(self.listed_over, ["a.example:1", "b.example:2"])           # tried on a second route
+        c = done["counts"]
+        self.assertEqual((c["listed"], c["site_count"], c["hidden"], c["selected"]), (0, 27, 27, 0))
+        self.assertIn("listed 0 of 27: the listing may have been cut short, over a.example:1 and again over "
+                      "b.example:2; the site hid 27 videos in this listing; they may have gone private, or this "
+                      "route may be served a restricted view", done["message"])
+        self.assertNotIn("Deno", done["message"])                                  # a runtime was found
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(pull.wait(done["id"], poll_s=0), 4)
+        self.assertEqual(server_mod._job_view(pull.read_job(done["id"]))["counts"]["hidden"], 27)
+
+    def test_an_empty_listing_is_short_only_when_the_site_gave_a_count(self):
+        self.assertTrue(pull.cut_short(0, 27, None, 100))
+        self.assertTrue(pull.cut_short(0, 2, None, 100))
+        self.assertEqual(pull.cut_short(0, 0, None, 100), "")
+        self.assertEqual(pull.cut_short(0, None, None, 100), "")
+        self.playlist_by_route({"direct": (0, None)})
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        self.assertEqual((done["state"], self.listed_over), ("done", ["direct"]))
+        self.playlist_by_route({"direct": (0, 27)})
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        self.assertEqual(done["state"], "partial")
+        self.assertIn("listed 0 of 27", done["message"])
+        self.assertEqual(done["counts"]["hidden"], 0)
+        self.assertNotIn("hid", done["message"])
+
+    def test_the_hidden_note_said_twice_in_one_listing_counts_once(self):
+        # the installed yt-dlp passes the playlist's alert on twice in one listing
+        self.playlist_by_route({"direct": (0, 27)}, warnings=[self.HIDDEN, self.HIDDEN.replace("INFO", "info")])
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        self.assertEqual((done["state"], done["counts"]["hidden"]), ("partial", 27))
+        self.assertIn("the site hid 27 videos", done["message"])
+
+    def test_hidden_is_zero_when_listing_again_makes_the_listing_whole(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        self.playlist_by_route({"a.example": (0, 27), "b.example": (27, 27)}, warnings={"a.example": [self.HIDDEN]})
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(self.listed_over, ["a.example:1", "b.example:2"])
+        self.assertEqual((done["counts"]["listed"], done["counts"]["hidden"]), (27, 0))
+        self.assertNotIn("hid", done["message"])
+
+    def test_refusals_by_route_is_current_while_the_pull_runs_and_not_counted_twice(self):
+        os.environ["PROXY_URLS"] = "http://p.example:1"
+        ids = [f"{i:011d}" for i in range(6)]
+        seen = {}
+
+        def fetcher(vid, langs, proxy):
+            if vid == ids[1]:
+                raise self.RequestBlocked()
+            if vid == ids[3]:                    # the refusal is still in the route's last 10
+                seen["live"] = pull.list_jobs(1)[0]["refusals_by_route"]
+            return self.ok()
+
+        done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "details": False, "max_videos": 0},
+                                 lister=PullTests.lister(ids), fetcher=fetcher)
+        self.assertEqual(seen["live"], {"p.example:1": 1})
+        self.assertEqual((done["state"], done["refusals_by_route"]), ("done", {"p.example:1": 1}))
+        self.assertIn("over p.example:1, 1 video got no answer from the site", done["message"])
+
+    def test_the_hidden_warning_is_read_whatever_its_case_and_number(self):
+        for text, n in ((self.HIDDEN, 27), ("youtube said: info - 1 Unavailable Video Is Hidden", 1),
+                        ("YouTube said: INFO - 1,204 unavailable videos are hidden", 1204),
+                        ("[youtube:tab] Incomplete data received", 0), ("27 videos are hidden", 0)):
+            self.assertEqual(pull.hidden_count(text), n, text)
+
+    # ---- the Deno sentence -------------------------------------------------------------------------
+
+    def test_a_partial_job_names_a_missing_javascript_runtime(self):
+        from unittest import mock
+        self.playlist_by_route({"direct": (99, 174)})
+        with mock.patch.object(pull.shutil, "which", lambda name: None):
+            done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0,
+                                      "details": False})
+        self.assertEqual(done["state"], "partial")
+        self.assertIn("No JavaScript runtime (Deno) was found; yt-dlp says listings may fail without one: install "
+                      "Deno", done["message"])
+        self.playlist_by_route({"direct": (174, 174)})
+        with mock.patch.object(pull.shutil, "which", lambda name: None):
+            done, _ = self.pull_with({"kind": "playlist", "target": "PLzyxwvut98765", "max_videos": 0,
+                                      "details": False})
+        self.assertEqual(done["state"], "done")
+        self.assertNotIn("Deno", done["message"])                                  # only a partial job says it
+
+    # ---- P3-18: pull_resume overrides --------------------------------------------------------------
+
+    def test_pull_resume_takes_workers_delay_and_limit_with_the_same_checks(self):
+        import server as server_mod
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2,http://c.example:3"
+        real, real_need = pull.create_job, server_mod._need_pull_packages
+        self.addCleanup(setattr, pull, "create_job", real)
+        self.addCleanup(setattr, server_mod, "_need_pull_packages", real_need)
+        pull.create_job, server_mod._need_pull_packages = pull.build_job, lambda: None
+        old = pull.build_job({"kind": "playlist", "target": "PLabcdefgh1234", "workers": 1, "delay_ms": 8000,
+                              "max_requests_per_minute": 6})
+        old["state"] = "partial"
+        pull.write_job(old)
+        same = server_mod.t_pull_resume({"job_id": old["id"]})
+        self.assertEqual((same["workers"], same["delay_ms"], same["request_limit_per_minute"]), (1, 8000, 6))
+        got = server_mod.t_pull_resume({"job_id": old["id"], "workers": 4, "delay_ms": 3000,
+                                        "max_requests_per_minute": 12})
+        self.assertEqual((got["workers"], got["delay_ms"], got["request_limit_per_minute"]), (3, 3000, 12))
+        self.assertIn("workers reduced from 4 to 3", got["note"])                # clamped to the routes
+        self.assertEqual(got["resumed_from"], old["id"])
+        zero = server_mod.t_pull_resume({"job_id": old["id"], "workers": 0, "delay_ms": 0,
+                                         "max_requests_per_minute": 0, "retry_missing": None})
+        self.assertEqual((zero["workers"], zero["delay_ms"], zero["request_limit_per_minute"]), (1, 8000, 6))
+        nothing = server_mod.t_pull_resume({"job_id": old["id"], "workers": None, "max_requests_per_minute": None})
+        self.assertEqual((nothing["workers"], nothing["request_limit_per_minute"]), (1, 6))   # the earlier job's
+        low = server_mod.t_pull_resume({"job_id": old["id"], "delay_ms": 10})
+        self.assertEqual((low["delay_ms"], low["workers"]), (config.MIN_DELAY_MS, 1))   # the floor holds
+        with self.assertRaisesRegex(pull.PullError, "max_requests_per_minute"):
+            server_mod.t_pull_resume({"job_id": old["id"],
+                                      "max_requests_per_minute": config.MAX_REQUESTS_PER_MINUTE + 1})
+        props = server_mod._BY_NAME["pull_resume"][3]
+        self.assertTrue({"workers", "delay_ms", "max_requests_per_minute"} <= set(props))
 
 
 class MineTests(Base):
