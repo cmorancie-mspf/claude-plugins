@@ -465,17 +465,19 @@ class _Quiet:
     def __init__(self):
         self.errors: list = []
         self.warnings: list = []
-        self.hidden = 0          # videos the site said it hid, summed over every such line seen
+        # videos the site said it hid: the largest number seen. yt-dlp passes the same note on more than
+        # once in one listing, so the lines are not added up. list_videos sets it to 0 before each tab.
+        self.hidden = 0
 
     def debug(self, msg): pass
     def info(self, msg): pass
 
     def warning(self, msg):
-        self.hidden += hidden_count(msg)
+        self.hidden = max(self.hidden, hidden_count(msg))
         self.warnings = (self.warnings + [str(msg)])[-self.KEEP:]
 
     def error(self, msg):
-        self.hidden += hidden_count(msg)
+        self.hidden = max(self.hidden, hidden_count(msg))
         self.errors = (self.errors + [str(msg)])[-self.KEEP:]
 
 
@@ -632,8 +634,8 @@ def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) 
     whole page), short_notes (the warnings that said so), short_detail (what was short, for the
     end message), tabs ({tab name or 'the playlist': {count, ids, short, hidden}}: each tab's own
     count, the ids of the entries it returned, whether it was short, and how many videos the site
-    said it hid from it, so that a second listing can be judged tab by tab), hidden (those hidden
-    counts summed, from yt-dlp's 'N unavailable videos are hidden') and errors (yt-dlp's own
+    said it hid from it (the largest 'N unavailable videos are hidden' yt-dlp passed on for that tab),
+    so that a second listing can be judged tab by tab), hidden (the tabs' hidden counts summed) and errors (yt-dlp's own
     error lines during the listing, with credentials filtered out). A listing of 0 entries is short
     when the site's count is above 0."""
     cap = job["max_videos"]
@@ -664,7 +666,7 @@ def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) 
     counts: list = []
     for kind, url in urls:
         take()                             # outside the try: a stop while waiting is not a failed tab
-        hidden_before = log.hidden
+        log.hidden = 0
         try:
             with _ydl(proxy, flat, log) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -672,7 +674,7 @@ def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) 
             log.error(f"{type(e).__name__}: {e}")
             info = None
         name = url.rsplit('/', 1)[-1] if job['kind'] == 'channel' else 'the playlist'
-        hidden = log.hidden - hidden_before
+        hidden = log.hidden
         if not info or "entries" not in info:
             errors += 1
             counts.append(None)
@@ -697,7 +699,7 @@ def list_videos(job: dict, proxy: Optional[str], take: Callable = lambda: None) 
                 listing["short_detail"].append(f"{name}: listed {len(raw)} of {total}")
     _note_warnings(job, log)
     listing["errors"] = [config.scrub(m)[:300] for m in log.errors]
-    listing["hidden"] = log.hidden
+    listing["hidden"] = sum(int(t.get("hidden") or 0) for t in listing["tabs"].values())
     if counts and all(c is not None for c in counts):
         listing["site_count"] = sum(counts)
     if errors == len(urls):
@@ -920,6 +922,7 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
     job = read_job(job_id)
     settings = config.load_settings()
     lock = threading.Lock()
+    on_save: list = []          # called with `lock` held before each write of the record
     stop_file = jobs_dir() / f"{job_id}.stop"
     done_evt = threading.Event()
     limit = limit_in_force(job)
@@ -928,6 +931,8 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
     def save(**changes) -> None:
         with lock:
             job.update(changes)
+            for f in on_save:
+                f()
             job["requests"] = rate.count
             if rate.count >= 2 and rate.last > rate.first:      # from the first request to the latest
                 job["request_span_seconds"] = round(rate.last - rate.first, 3)
@@ -1027,6 +1032,8 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
                         still.append(f"{name}: listed {len(ids)}" + (f" of {most}" if most is not None else ""))
                 site_all = sum(tab_counts) if tab_counts and all(c is not None for c in tab_counts) else None
                 short = bool(still) and not (cap and len(listed) >= cap)
+                if not short:
+                    hidden_all = 0         # the listing used came back whole: nothing is missing from it
                 info = {**info, "site_count": site_all, "short": short, "short_detail": still or first_detail,
                         "hidden": hidden_all}
                 log(f"listed again over {listed_over[1]}: {len(again)}; {len(listed)} in all"
@@ -1066,7 +1073,10 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
         out: list = []                     # (route, the last reason seen over it, the rule that took it out)
         failed_out = [0]                   # videos whose failure took a route out
         reasons_seen: set = set()
-        refusals = job.setdefault("refusals_by_route", {})    # host:port: refusals that did not take it out
+        # host:port: refusals that did not take the route out, counted once they leave its window (or at
+        # the end). The record's refusals_by_route also holds those still in the window of a route in
+        # use (publish_refusals), so pull_status is current while the pull runs.
+        refusals: dict = dict(job.get("refusals_by_route") or {})
         # Per route, its last RATE_WINDOW videos, oldest first: (got no answer, reason, the site's own
         # silence). Kept while the route stands by, so a route keeps its record when it comes back.
         windows: dict = {}
@@ -1099,6 +1109,19 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
             if k:
                 masked = config.mask_proxy(proxy)
                 refusals[masked] = refusals.get(masked, 0) + k
+
+        def publish_refusals() -> None:
+            """refusals_by_route in the record: those counted, plus the site's refusals still in the window of
+            a route in use. Called with `lock` held."""
+            shown = dict(refusals)
+            for proxy, win in windows.items():
+                k = sum(1 for refused, _, site_said_nothing in win if refused and site_said_nothing)
+                if k:
+                    masked = config.mask_proxy(proxy)
+                    shown[masked] = shown.get(masked, 0) + k
+            job["refusals_by_route"] = shown
+
+        on_save.append(publish_refusals)
 
         def record(proxy: Optional[str], refused: bool, why: str, site: bool) -> str:
             """Add one handled video to its route's window. Returns the rule that takes the route out, or ''."""

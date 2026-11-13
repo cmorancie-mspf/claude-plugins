@@ -382,8 +382,9 @@ def t_pull_resume(a: dict) -> dict:
         if v:
             spec[k] = v
     # A value given to pull_resume wins over the earlier job's, checked and bounded as on a new pull.
+    # 0 or nothing keeps the earlier job's value.
     for k in pull.RATE_KEYS:
-        if a.get(k) is not None:
+        if a.get(k):
             spec[k] = a[k]
     if old["kind"] == "channel":
         spec["target"] = old["target"] if old["target"].startswith("@") else "https://www.youtube.com/" + old["target"]
@@ -781,14 +782,16 @@ TOOLS = [
      "Start a pull again with the settings of an earlier job that stopped, was blocked, failed, died or ended "
      "partial (it lists again). Stored videos are skipped, and so are videos known to have no transcript. "
      "workers, delay_ms and max_requests_per_minute, when given, replace the earlier job's, with the same limits as "
-     "on a new pull. " + WAIT_NOTE,
+     "on a new pull; 0 or leaving one out keeps the earlier job's value. " + WAIT_NOTE,
      {"job_id": _s("The earlier job's id."), "retry_missing": _PULL_PROPS["retry_missing"],
-      "workers": _n("Parallel fetchers for this pull, instead of the earlier job's. Never more than the number of "
+      "workers": _n("Parallel fetchers for this pull, instead of the earlier job's (0 or omitted: the earlier "
+                    "job's). Never more than the number of "
                     f"distinct proxy routes, and at most {config.MAX_WORKERS}."),
-      "delay_ms": _n("Pause after each video, per worker, instead of the earlier job's; values under "
-                     f"{config.MIN_DELAY_MS} are raised to it."),
+      "delay_ms": _n("Pause after each video, per worker, instead of the earlier job's (0 or omitted: the "
+                     f"earlier job's); values under {config.MIN_DELAY_MS} are raised to it."),
       "max_requests_per_minute": _n("A limit on requests to the site for the whole pull, instead of the earlier "
-                                    f"job's, 1 to {config.MAX_REQUESTS_PER_MINUTE}.")}, ["job_id"]),
+                                    f"job's, 1 to {config.MAX_REQUESTS_PER_MINUTE} (0 or omitted: the earlier "
+                                    "job's).")}, ["job_id"]),
     ("pull_stop", t_pull_stop,
      "Ask a running pull to stop. It finishes the request it is on, keeps everything stored, and can be resumed.",
      {"job_id": _s("The job id.")}, ["job_id"]),

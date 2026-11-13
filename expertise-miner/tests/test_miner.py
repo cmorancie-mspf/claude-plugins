@@ -1232,7 +1232,8 @@ class Phase2Tests(Base):
         return done, printed.getvalue()
 
     def playlist_by_route(self, by_route, errors=(), warnings=()):
-        """yt-dlp replaced: the listing over a route whose name holds a key of by_route returns
+        """yt-dlp replaced: warnings are passed to its logger on every listing (a dict of them by route
+        key: only over that route). The listing over a route whose name holds a key of by_route returns
         (entries, playlist_count) for it, or (entries, playlist_count, first id number); for a
         channel, a dict of those by tab. Records the routes listed over in self.listed_over."""
         test = self
@@ -1252,7 +1253,9 @@ class Phase2Tests(Base):
                 test.listed_over.append(config.mask_proxy(self.proxy))
                 for e in errors:
                     self.logger.error(e)
-                for w in warnings:
+                lines = (next((v for k, v in warnings.items() if k in (self.proxy or "direct")), [])
+                         if isinstance(warnings, dict) else warnings)
+                for w in lines:
                     self.logger.warning(w)
                 got = next(v for k, v in by_route.items() if k in (self.proxy or "direct"))
                 tab = url.rsplit("/", 1)[-1]
@@ -1945,6 +1948,40 @@ class Phase3Tests(Base):
         self.assertEqual(done["counts"]["hidden"], 0)
         self.assertNotIn("hid", done["message"])
 
+    def test_the_hidden_note_said_twice_in_one_listing_counts_once(self):
+        # the installed yt-dlp passes the playlist's alert on twice in one listing
+        self.playlist_by_route({"direct": (0, 27)}, warnings=[self.HIDDEN, self.HIDDEN.replace("INFO", "info")])
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        self.assertEqual((done["state"], done["counts"]["hidden"]), ("partial", 27))
+        self.assertIn("the site hid 27 videos", done["message"])
+
+    def test_hidden_is_zero_when_listing_again_makes_the_listing_whole(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        self.playlist_by_route({"a.example": (0, 27), "b.example": (27, 27)}, warnings={"a.example": [self.HIDDEN]})
+        done, _ = self.pull_with({"kind": "playlist", "target": "PLabcdefgh1234", "max_videos": 0, "details": False})
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(self.listed_over, ["a.example:1", "b.example:2"])
+        self.assertEqual((done["counts"]["listed"], done["counts"]["hidden"]), (27, 0))
+        self.assertNotIn("hid", done["message"])
+
+    def test_refusals_by_route_is_current_while_the_pull_runs_and_not_counted_twice(self):
+        os.environ["PROXY_URLS"] = "http://p.example:1"
+        ids = [f"{i:011d}" for i in range(6)]
+        seen = {}
+
+        def fetcher(vid, langs, proxy):
+            if vid == ids[1]:
+                raise self.RequestBlocked()
+            if vid == ids[3]:                    # the refusal is still in the route's last 10
+                seen["live"] = pull.list_jobs(1)[0]["refusals_by_route"]
+            return self.ok()
+
+        done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "details": False, "max_videos": 0},
+                                 lister=PullTests.lister(ids), fetcher=fetcher)
+        self.assertEqual(seen["live"], {"p.example:1": 1})
+        self.assertEqual((done["state"], done["refusals_by_route"]), ("done", {"p.example:1": 1}))
+        self.assertIn("over p.example:1, 1 video got no answer from the site", done["message"])
+
     def test_the_hidden_warning_is_read_whatever_its_case_and_number(self):
         for text, n in ((self.HIDDEN, 27), ("youtube said: info - 1 Unavailable Video Is Hidden", 1),
                         ("YouTube said: INFO - 1,204 unavailable videos are hidden", 1204),
@@ -1989,6 +2026,11 @@ class Phase3Tests(Base):
         self.assertEqual((got["workers"], got["delay_ms"], got["request_limit_per_minute"]), (3, 3000, 12))
         self.assertIn("workers reduced from 4 to 3", got["note"])                # clamped to the routes
         self.assertEqual(got["resumed_from"], old["id"])
+        zero = server_mod.t_pull_resume({"job_id": old["id"], "workers": 0, "delay_ms": 0,
+                                         "max_requests_per_minute": 0, "retry_missing": None})
+        self.assertEqual((zero["workers"], zero["delay_ms"], zero["request_limit_per_minute"]), (1, 8000, 6))
+        nothing = server_mod.t_pull_resume({"job_id": old["id"], "workers": None, "max_requests_per_minute": None})
+        self.assertEqual((nothing["workers"], nothing["request_limit_per_minute"]), (1, 6))   # the earlier job's
         low = server_mod.t_pull_resume({"job_id": old["id"], "delay_ms": 10})
         self.assertEqual((low["delay_ms"], low["workers"]), (config.MIN_DELAY_MS, 1))   # the floor holds
         with self.assertRaisesRegex(pull.PullError, "max_requests_per_minute"):
