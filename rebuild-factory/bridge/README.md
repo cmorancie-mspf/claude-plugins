@@ -18,9 +18,9 @@ A run is **auto-approved** by default: OpenCode does whatever its rules do not d
 
 | MCP tool | CLI | What it does |
 |---|---|---|
-| `opencode_start` | `node oc.mjs start <id> --dir <folder> --prompt-file <f> --config <rules> [--model <provider/model>] [--thinking] [--no-auto] [--no-rules]` | Starts a run as a detached process. Returns at once. |
+| `opencode_start` | `node oc.mjs start <id> --dir <folder> --prompt-file <f> --config <rules> [--model <provider/model>] [--thinking] [--no-auto] [--no-rules] [--max-concurrent <n>] [--scrub-env NAME,PREFIX_*]` | Starts a run as a detached process. Returns at once. |
 | `opencode_answer` | `node oc.mjs answer <id> --prompt "<text>"` | Continues the same OpenCode session after the run has ended. |
-| `opencode_status` | `node oc.mjs status <id> [--tail 50]` | Status, exit code, seconds since last output, whether the rules file changed, end of the log. |
+| `opencode_status` | `node oc.mjs status <id> [--tail 50]` | Status, exit code, how it ended (`end_kind`), seconds since last output, whether the rules file changed, end of the log. |
 | `opencode_stop` | `node oc.mjs stop <id>` | Stops the run. The session can still be continued. |
 | `opencode_list` | `node oc.mjs list` | Every run, newest first. |
 | (none) | `node oc.mjs wait <id> [--stall-min 20]` | Blocks until the run ends. Exit 0 finished, 1 failed or stopped, 3 nothing printed for the stall time. |
@@ -38,6 +38,13 @@ An MCP server cannot wake an idle Claude session. `opencode_start` and `opencode
 - A rules file has one shape: `"$schema"` and `"permission"` at the top, and under `permission.bash` an optional first `"*": "allow"` followed by denies only. Anything else is refused: another top-level key is something OpenCode would load or run, and an allow placed later, or a narrower allow, could switch a deny off while the deny is still listed.
 - A run with rules uses a private OpenCode server (`--standalone`), because the shared background service does not see the run's environment.
 
+## Provider cap, how a run ended, and the environment
+
+- **Provider cap.** With `max_concurrent` (and a model), `start` counts the live runs of the same provider (the part of the model before the `/`) in the shared store, whichever program started them, and refuses when the cap is reached. The count and the new record are made under one lock, so two starts at once cannot both get in. Without `max_concurrent` there is no cap.
+- **How a run ended.** When a turn exits non-zero, `end_kind` is `rate_limited`, `auth`, `quota` or `other`, read from the last 15 lines the run printed (the bridge's own lines left out). That is a heuristic over text: a run whose own last lines mention a 429 for another reason is misread, and a provider that words its errors differently comes out as `other`. Exit 0 is always `ok`; a stopped run is `stopped`, a vanished one `died`.
+- **Environment scrub.** `scrub_env` drops variables from the run's environment, by name or `PREFIX_*`, matched without case, for every turn of the run. It removes variables only: credential files in the home folder stay readable.
+- Run records are `"format": 2`. A record without `format` was written by an earlier bridge and is read the same way.
+
 ## Things to know
 
 - State and logs are under `~/.oc-bridge/runs/<id>/` (`OC_BRIDGE_HOME` overrides). The log holds everything the run printed, and its reasoning if `--thinking` is on; it is kept until you delete the folder.
@@ -52,7 +59,7 @@ An MCP server cannot wake an idle Claude session. `opencode_start` and `opencode
 
 ## Supporting another builder tool
 
-The rebuild-factory loop needs five operations from a bridge. A bridge for another coding agent offers the same ones:
+A conductor loop needs five operations from a bridge. A bridge for another coding agent offers the same ones:
 
 | Operation | Must do |
 |---|---|
@@ -64,6 +71,6 @@ The rebuild-factory loop needs five operations from a bridge. A bridge for anoth
 
 ## Register with Claude Code
 
-Inside the rebuild-factory plugin this server is registered by the plugin's `.mcp.json`. To use the bridge alone:
+Inside a plugin that carries it, this server is registered by the plugin's `.mcp.json`; a plugin may set `OC_BRIDGE_TOOLS` there to offer only some tools (for example `status,stop,list` when its own helper starts the runs). To use the bridge alone:
 
     claude mcp add --scope user oc-bridge -- node "<path to this folder>/mcp.mjs"
