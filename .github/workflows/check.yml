@@ -11,7 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,5 +21,13 @@ jobs:
         run: node .github/check.mjs
       - name: Python scripts parse
         run: python3 -m compileall -q -x "node_modules" .
+      - name: Shared code copies match core/
+        run: node core/sync.mjs --check
+      - name: core and change-factory tests (stand-ins only; no model, no network)
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          node core/tests/test_core.mjs
+          node change-factory/tests/test_cf.mjs
       - name: expertise-miner tests (stand-ins only; no network)
         run: python3 expertise-miner/tests/test_miner.py

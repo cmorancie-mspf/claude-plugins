@@ -16,6 +16,7 @@ Then install a plugin by name:
 claude plugin install rebuild-factory@production-ai
 claude plugin install transcribe@production-ai
 claude plugin install expertise-miner@production-ai
+claude plugin install change-factory@production-ai
 ```
 
 From a local copy of this repository, give the folder's path in place of `production-ai-eng/claude-plugins`.
@@ -29,6 +30,7 @@ If you are an AI agent: [INSTALL.md](INSTALL.md) is written for installing these
 | [rebuild-factory](rebuild-factory/README.md) | Audit an existing codebase, write a plan a cheaper model can build from, and run the rebuild as a loop in which each small session is reproduced from a clean clone and attacked before it is merged | Early: see its notice |
 | [transcribe](transcribe/README.md) | Turn an audio or video file, or a URL, into a transcript, processed on your own machine. No API key; the audio is not sent to any speech service | In regular use on Windows; untried on macOS and Linux |
 | [expertise-miner](expertise-miner/README.md) | Pull a YouTube channel's transcripts into a searchable local corpus, then mine them for an expert's research questions, rules of thumb and research steps, each with a quote checked against the transcript, a timestamp and a way to test it | New: see its notice |
+| [change-factory](change-factory/README.md) | Run a list of fixes and features on a working system as parallel workstreams built by cheap workers, each reviewed, tested on the exact commit, merged and red-teamed, with every deploy, push and owner decision left to the owner | New: drawn from one real run; see its notice |
 
 ### rebuild-factory
 
@@ -61,6 +63,12 @@ Requires Node 20 or later and git; the build stage also needs [OpenCode](https:/
 - **Guide for owners:** [rebuild-factory/docs/USER-GUIDE.md](rebuild-factory/docs/USER-GUIDE.md)
 - **What ships, and the method:** [rebuild-factory/README.md](rebuild-factory/README.md)
 - **The OpenCode bridge alone, and how to support another builder tool:** [rebuild-factory/bridge/README.md](rebuild-factory/bridge/README.md)
+
+### change-factory
+
+For changing a system that already works: an owner's list becomes workstreams that cheap OpenCode workers build in parallel, while Claude briefs, reviews, merges and red-teams. Type `/change-factory` in a chat opened on the repository. See [its README](change-factory/README.md), including what protects what.
+
+> **Read this before you run it.** Workers run auto-approved on your machine under deny rules that match command text; they are not a sandbox. Run it where workers cannot reach production credentials if you can. Deploys, pushes, moves of main and owner decisions are refused from the chat by default and accepted only when you type `yes` in your own terminal. **Status: new.** Drawn from one real run; tested with stand-ins on Windows.
 
 ### transcribe
 
@@ -97,11 +105,11 @@ Requires Node 18 or later and Python 3.9 or later. Pulling needs two Python pack
   skills/  agents/  ...
 ```
 
-To add a plugin: put its folder at the top level, add an entry to `marketplace.json` with `"source": "./<folder>"`, and add a row to the table above. Run `claude plugin validate .` and `node .github/check.mjs` before committing.
+To add a plugin, follow [PLAYBOOK.md](PLAYBOOK.md): a plugin is listed in `marketplace.json` only after an independent review has approved it, and the commands to run before a commit are in [AGENTS.md](AGENTS.md#before-you-commit).
 
 ## Contributing
 
-Reports of what did not work on your codebase are the most useful contribution. See [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md) for reporting a security problem. Never put a real project's findings, plans or data into this repository.
+To write or change a plugin, follow [PLAYBOOK.md](PLAYBOOK.md). Reports of what did not work on your codebase are the most useful contribution. See [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md) for reporting a security problem. Never put a real project's findings, plans or data into this repository.
 
 ## Licence
 

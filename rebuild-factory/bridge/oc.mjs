@@ -5,6 +5,7 @@
 //
 //   node oc.mjs start  <run-id> --dir <folder> (--prompt-file <f> | --prompt <text>) --config <rules file>
 //                      [--model <provider/model>] [--thinking] [--no-auto] [--no-rules] [--allow-project-config]
+//                      [--max-concurrent <n>] [--scrub-env NAME,PREFIX_*,...]
 //   node oc.mjs answer <run-id> (--prompt-file <f> | --prompt <text>)
 //   node oc.mjs status <run-id> [--tail <lines>]
 //   node oc.mjs wait   <run-id> [--stall-min <minutes>]     exits when the run ends
@@ -13,6 +14,12 @@
 //
 // An auto-approved run needs a rules file (--config). The rules are frozen when the run starts:
 // a copy is kept with the run and every turn uses that copy.
+//
+// --max-concurrent caps live runs per provider (the part of --model before the "/"), counted over
+// every run in the shared store under a lock, whichever program started them. --scrub-env drops
+// environment variables (names, or PREFIX_* patterns, any case) from the run's environment, for
+// every turn. When a turn fails, end_kind says how, from the end of the log: rate_limited, auth,
+// quota or other. That is a heuristic over text the run printed (see classifyEnd).
 
 import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -27,6 +34,8 @@ const RUNS = path.join(HOME, 'runs');
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MODEL_RE = /^[A-Za-z0-9][\w.-]*\/[\w@.:\/-]+(#[\w.-]+)?$/;
 const WIN = process.platform === 'win32';
+const FORMAT = 2;
+const SCRUB_RE = /^[A-Za-z_][A-Za-z0-9_]*\*?$/;
 
 export class BridgeError extends Error {}
 
@@ -128,6 +137,57 @@ function promptToFile(id, turn, { prompt, promptFile }) {
   return p;
 }
 
+// A lock file created exclusively; one older than 30 s is taken over (its holder died).
+function withLock(file, fn) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const until = Date.now() + 15_000;
+  for (;;) {
+    try { fs.writeFileSync(file, String(process.pid), { flag: 'wx' }); break; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let age = 0;
+      try { age = Date.now() - fs.statSync(file).mtimeMs; } catch { continue; }
+      if (age > 30_000) { try { fs.rmSync(file); } catch { /* taken */ } continue; }
+      if (Date.now() > until) throw new BridgeError('could not get the start lock ' + file);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try { return fn(); } finally { try { fs.rmSync(file); } catch { /* gone */ } }
+}
+
+const providerOf = (model) => (model ? String(model).split('/')[0] : null);
+
+// Live runs of a provider in the shared store (any program's), by their recorded model.
+function liveFor(provider, except) {
+  let ids = [];
+  try { ids = fs.readdirSync(RUNS); } catch { return []; }
+  const out = [];
+  for (const i of ids) {
+    if (i === except || !fs.existsSync(statePath(i))) continue;
+    try {
+      const st = status({ id: i, tail: 0 });
+      if ((st.status === 'running' || st.status === 'starting') && providerOf(st.model) === provider) out.push(i);
+    } catch { /* a damaged record is not a live run */ }
+  }
+  return out;
+}
+
+// How a failed turn ended, read from the last lines the run printed (the bridge's own lines
+// left out). A heuristic over text: a run that prints "429" for another reason in its last
+// lines is misread, and a provider that words its errors differently is "other".
+const END_PATTERNS = [
+  ['quota', /\b402\b|quota|insufficient[ _-]?(credit|balance|funds)|out of credits|credits? (exhausted|exceeded|ran out)|billing/i],
+  ['rate_limited', /\b429\b|rate[ _-]?limit|too many requests|overloaded/i],
+  ['auth', /\b401\b|\b403\b|unauthori[sz]ed|forbidden|invalid[ _-]?api[ _-]?key|authentication|not logged in/i],
+];
+export function classifyEnd(code, logText, lastLines = 15) {
+  if (code === 0) return 'ok';
+  const own = (l) => l.startsWith('[oc-bridge]') || l.startsWith('===== oc-bridge');
+  const tail = String(logText || '').replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !own(l)).slice(-lastLines).join('\n');
+  for (const [kind, re] of END_PATTERNS) if (re.test(tail)) return kind;
+  return 'other';
+}
+
 function launch(id) {
   const child = spawn(process.execPath, [SELF, '_run', id], { detached: true, stdio: 'ignore', windowsHide: true });
   child.unref();
@@ -184,8 +244,15 @@ function effectiveRules(text) {
   return JSON.stringify({ ...rules, default_agent: 'build', agent });
 }
 
-export function start({ id, dir, prompt, promptFile, model, auto = true, config, thinking = false, noRules = false, allowProjectConfig = false }) {
+export function start({ id, dir, prompt, promptFile, model, auto = true, config, thinking = false, noRules = false, allowProjectConfig = false, maxConcurrent = null, scrubEnv = [] }) {
   checkId(id);
+  if (maxConcurrent !== null && maxConcurrent !== undefined) {
+    if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) throw new BridgeError('max_concurrent must be a whole number, 1 or more');
+    if (!model) throw new BridgeError('a provider cap (max_concurrent) needs a model: the provider is the part of the model before the "/"');
+  } else maxConcurrent = null;
+  if (!Array.isArray(scrubEnv) || !scrubEnv.every((x) => typeof x === 'string' && SCRUB_RE.test(x))) {
+    throw new BridgeError('scrub_env takes variable names or PREFIX_* patterns (letters, digits and _, an optional * at the end)');
+  }
   if (fs.existsSync(statePath(id))) throw new BridgeError(`run "${id}" exists; use answer to continue it, or pick a new id`);
   if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new BridgeError(`folder not found: ${dir}`);
   if (model && !MODEL_RE.test(model)) throw new BridgeError(`bad model "${model}": give provider/model, as \`opencode models\` prints it`);
@@ -200,18 +267,30 @@ export function start({ id, dir, prompt, promptFile, model, auto = true, config,
     throw new BridgeError(`this folder has its own OpenCode config (${own.join(', ')}). A project config can define agents and permissions that override the rules. Remove it, or pass allow_project_config (--allow-project-config) after reading it.`);
   }
   const opencode = findOpencode();
-  fs.mkdirSync(runDir(id), { recursive: true });
-  if (rules) fs.writeFileSync(rulesPath(id), rules.text);
-  const file = promptToFile(id, 1, { prompt, promptFile });
-  writeState(id, {
-    id, dir: path.resolve(dir), model: model || null, auto: !!auto, opencode,
-    config: rules ? rules.abs : null, rules_sha256: rules ? sha(rules.text) : null, thinking: !!thinking,
-    allow_project_config: !!allowProjectConfig,
-    session: 'ses_' + id.replace(/[^A-Za-z0-9]/g, '') + Date.now().toString(36),
-    status: 'starting', turn: 1, turns: [{ turn: 1, prompt_file: file, started_at: new Date().toISOString() }],
-    pid: null, runner_pid: null, exit_code: null,
-  });
-  fs.writeFileSync(logPath(id), '');
+  if (promptFile && !fs.existsSync(path.resolve(promptFile))) throw new BridgeError(`prompt file not found: ${path.resolve(promptFile)}`);
+  if (!promptFile && !(prompt && prompt.trim())) throw new BridgeError('give a prompt or a prompt file');
+  const create = () => {
+    if (maxConcurrent) {
+      const provider = providerOf(model);
+      const live = liveFor(provider, id);
+      if (live.length >= maxConcurrent) throw new BridgeError(`provider "${provider}" has ${live.length} live run(s) (${live.join(', ')}); its cap is ${maxConcurrent}. Wait for one to end.`);
+    }
+    if (fs.existsSync(statePath(id))) throw new BridgeError(`run "${id}" exists; use answer to continue it, or pick a new id`);
+    fs.mkdirSync(runDir(id), { recursive: true });
+    if (rules) fs.writeFileSync(rulesPath(id), rules.text);
+    const file = promptToFile(id, 1, { prompt, promptFile });
+    writeState(id, {
+      format: FORMAT, id, dir: path.resolve(dir), model: model || null, provider: providerOf(model), auto: !!auto, opencode,
+      config: rules ? rules.abs : null, rules_sha256: rules ? sha(rules.text) : null, thinking: !!thinking,
+      allow_project_config: !!allowProjectConfig, max_concurrent: maxConcurrent, scrub_env: scrubEnv,
+      session: 'ses_' + id.replace(/[^A-Za-z0-9]/g, '') + Date.now().toString(36),
+      status: 'starting', turn: 1, turns: [{ turn: 1, prompt_file: file, started_at: new Date().toISOString() }],
+      pid: null, runner_pid: null, exit_code: null, end_kind: null,
+    });
+    fs.writeFileSync(logPath(id), '');
+  };
+  // The count and the new record happen under one lock, so two starts cannot both see room.
+  if (maxConcurrent) withLock(path.join(RUNS, '.start.lock'), create); else create();
   launch(id);
   return status({ id, tail: 0 });
 }
@@ -238,7 +317,7 @@ export function answer({ id, prompt, promptFile }) {
   const file = promptToFile(id, turn, { prompt, promptFile });
   s.turn = turn;
   s.turns.push({ turn, prompt_file: file, started_at: new Date().toISOString() });
-  s.status = 'starting'; s.pid = null; s.runner_pid = null; s.exit_code = null; delete s.ended_at;
+  s.status = 'starting'; s.pid = null; s.runner_pid = null; s.exit_code = null; s.end_kind = null; delete s.ended_at;
   writeState(id, s);
   launch(id);
   return status({ id, tail: 0 });
@@ -279,11 +358,13 @@ export function status({ id, tail = 30 }) {
   if (s.config && s.rules_sha256) {
     try { rulesChanged = sha(fs.readFileSync(s.config, 'utf8')) !== s.rules_sha256; } catch { rulesChanged = true; }
   }
+  const endKind = s.end_kind || (st === 'died' ? 'died' : st === 'stopped' ? 'stopped' : null);
   return {
-    id, status: st, exit_code: s.exit_code, turn: s.turn, dir: s.dir, model: s.model,
+    format: s.format || 1, id, status: st, exit_code: s.exit_code, end_kind: endKind, turn: s.turn, dir: s.dir, model: s.model,
     config: s.config || null, rules: s.rules_sha256 ? 'frozen at start' : (s.auto ? 'NONE: auto-approved with nothing refused' : 'none'),
     rules_file_changed_since_start: rulesChanged,
-    thinking: !!s.thinking, session: s.session,
+    thinking: !!s.thinking, session: s.session, rules_sha256: s.rules_sha256 || null,
+    max_concurrent: s.max_concurrent ?? null, scrub_env: s.scrub_env || [],
     pid: s.pid, started_at: s.turns[s.turns.length - 1].started_at, ended_at: s.ended_at || null,
     seconds_since_output: st === 'running' ? quiet : null, log_bytes: logBytes, log: logPath(id),
     tail: tailOf(logPath(id), tail),
@@ -344,6 +425,9 @@ function runTurn(id) {
     }
     e.status = code === 0 ? 'finished' : 'failed';
     e.exit_code = code; e.ended_at = new Date().toISOString();
+    let logText = '';
+    try { logText = fs.readFileSync(logPath(id), 'utf8').slice(-200_000); } catch { /* none */ }
+    e.end_kind = classifyEnd(code, logText);
     e.turns[e.turns.length - 1].ended_at = e.ended_at;
     e.turns[e.turns.length - 1].exit_code = code;
     fs.writeSync(out, `\n===== oc-bridge turn ${e.turn} ended · exit ${code} · ${e.ended_at} =====\n`);
@@ -356,6 +440,14 @@ function runTurn(id) {
   const env = { ...process.env, PWD: s.dir };
   delete env.OLDPWD; delete env.INIT_CWD;
   delete env.OPENCODE_CONFIG; delete env.OPENCODE_CONFIG_CONTENT;
+  // Names are matched without case: a Windows environment copied into an object keeps its case.
+  for (const pat of s.scrub_env || []) {
+    const p = pat.toLowerCase();
+    for (const k of Object.keys(env)) {
+      const kl = k.toLowerCase();
+      if (p.endsWith('*') ? kl.startsWith(p.slice(0, -1)) : kl === p) delete env[k];
+    }
+  }
 
   const message = `Your instructions for this turn are in the file ${turn.prompt_file} . Read that whole file now and follow it exactly.`;
   const args = ['run', '--session', s.session];
@@ -412,6 +504,8 @@ function parseArgs(argv) {
     else if (a === '--thinking') o.thinking = true;
     else if (a === '--no-rules') o.noRules = true;
     else if (a === '--allow-project-config') o.allowProjectConfig = true;
+    else if (a === '--scrub-env') o.scrubEnv = String(argv[++i] || '').split(',').map((x) => x.trim()).filter(Boolean);
+    else if (a === '--max-concurrent') o.maxConcurrent = Number(argv[++i]);
     else if (a.startsWith('--')) o[a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = argv[++i];
     else o._.push(a);
   }
@@ -425,7 +519,7 @@ async function main() {
   const print = (v) => console.log(typeof v === 'string' ? v : JSON.stringify(v, null, 2));
   switch (cmd) {
     case '_run': return runTurn(id);
-    case 'start': return print(start({ id, dir: o.dir, prompt: o.prompt, promptFile: o.promptFile, model: o.model, auto: o.auto !== false, config: o.config, thinking: !!o.thinking, noRules: !!o.noRules, allowProjectConfig: !!o.allowProjectConfig }));
+    case 'start': return print(start({ id, dir: o.dir, prompt: o.prompt, promptFile: o.promptFile, model: o.model, auto: o.auto !== false, config: o.config, thinking: !!o.thinking, noRules: !!o.noRules, allowProjectConfig: !!o.allowProjectConfig, maxConcurrent: o.maxConcurrent ?? null, scrubEnv: o.scrubEnv || [] }));
     case 'answer': return print(answer({ id, prompt: o.prompt, promptFile: o.promptFile }));
     case 'status': return print(status({ id, tail: o.tail ? Number(o.tail) : 30 }));
     case 'stop': return print(stop({ id }));

@@ -41,6 +41,18 @@ if (market) {
     plugins.push(dir);
   }
 }
+// A plugin folder not yet listed in the marketplace (one waiting for its review) is checked too.
+for (const e of fs.readdirSync(root, { withFileTypes: true })) {
+  if (!e.isDirectory() || e.name.startsWith('.')) continue;
+  const dir = path.join(root, e.name);
+  const manifest = path.join(dir, '.claude-plugin', 'plugin.json');
+  if (!fs.existsSync(manifest) || plugins.some((p) => path.resolve(p) === path.resolve(dir))) continue;
+  const pj = readJson(manifest);
+  if (pj && pj.name !== e.name) bad(`${rel(manifest)}: name "${pj.name}" differs from its folder`);
+  if (pj && !/^\d+\.\d+\.\d+$/.test(pj.version || '')) bad(`${rel(manifest)}: version is not x.y.z`);
+  if (!fs.existsSync(path.join(dir, 'README.md'))) bad(`${rel(dir)}: no README.md`);
+  plugins.push(dir);
+}
 
 const front = /^---\r?\nname: (.+)\r?\ndescription: (.+)\r?\n(?:[a-z_-]+: .+\r?\n)*---\r?\n/;
 for (const dir of plugins) {
@@ -70,6 +82,13 @@ for (const dir of plugins) {
 for (const f of files.filter((x) => /\.(mjs|cjs|js)$/.test(x))) {
   try { execFileSync(process.execPath, ['--check', f], { stdio: 'pipe' }); }
   catch (e) { bad(`${rel(f)}: does not parse: ${String(e.stderr || e.message).split('\n')[0]}`); }
+}
+
+// Shared code is edited in core/ only. Each plugin's copy must match it, so a copy edited in place
+// (which is what gets installed) fails here instead of drifting.
+if (fs.existsSync(path.join(root, 'core', 'sync.mjs'))) {
+  try { execFileSync(process.execPath, [path.join(root, 'core', 'sync.mjs'), '--check'], { stdio: 'pipe' }); }
+  catch (e) { for (const l of String(e.stderr || e.message).split(/\r?\n/).filter((x) => x.startsWith('FAIL ') || x.startsWith('core sync:'))) bad(l.replace(/^FAIL /, '')); }
 }
 
 // Nothing inside a plugin may be hidden by an ignore rule: an ignored file is never published,

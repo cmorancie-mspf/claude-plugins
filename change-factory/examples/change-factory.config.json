@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "project": "example",
+  "main_branch": "main",
+  "worktree_root": "../example-wt",
+  "time_zone": "UTC",
+  "conductor_model": "opus",
+  "hook_mode": "deny",
+  "roles": {
+    "brief_writer": { "via": "subagent", "model": "opus", "effort": "high" },
+    "worker": { "via": "opencode", "model": "provider/model-id", "thinking": false, "escalate_after": 3, "stall_min": 20 },
+    "worker_escalation": { "via": "subagent", "model": "opus" },
+    "round_reviewer": { "via": "subagent", "model": "opus", "fallback": ["sonnet"], "on_fallback": "ok" },
+    "stream_red_team": { "via": "subagent", "model": "fable", "fallback": ["opus"], "on_fallback": "owed_pass" },
+    "research": { "via": "subagent", "model": "opus" }
+  },
+  "independence": { "reviewer_not_author": true, "red_team_not_reviewer": true, "red_team_not_author": true },
+  "providers": { "provider": { "max_concurrent": 4 } },
+  "machine": { "warn_below_free_gb": 1.0, "reserve_gb": 0.3, "per_worker_gb": 0.25 },
+  "budgets": { "max_rounds_per_stream": 4, "max_worker_runs": 30, "max_ci_runs": 12, "max_red_team_passes": 6 },
+  "tests": {
+    "mode": "local",
+    "stream_cmd": "npm test",
+    "combined_cmd": "npm test",
+    "report": "exit_code",
+    "required_suites": ["all"],
+    "regenerated_on_integration": []
+  },
+  "generated": { "commands": [], "paths": [] },
+  "test_paths": ["test/**", "tests/**"],
+  "docs_paths": ["docs/change-factory/**"],
+  "worker_rules": "change-factory/worker-rules.json",
+  "worker_env_scrub": [],
+  "flags": false,
+  "deploy_units": [
+    {
+      "name": "app",
+      "kind": "command",
+      "touched_by": ["src/**"],
+      "cmd": "npm run deploy",
+      "rollback_lookup": "",
+      "rollback": "redeploy the previous release",
+      "verify": "",
+      "after": []
+    }
+  ],
+  "push_cmd": "git push origin main",
+  "quiet_window_cmd": "",
+  "research_runner": ""
+}

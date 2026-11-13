@@ -2,6 +2,8 @@
 
 Instructions for an AI agent working in this repository. A person should read `README.md` first.
 
+Writing or changing a plugin? Follow `PLAYBOOK.md`: the steps from idea to release, the rules that are enforced, and why.
+
 ## What this repository is
 
 A Claude Code plugin marketplace named `production-ai`. Each top-level folder with a `.claude-plugin/plugin.json` is one plugin. `.claude-plugin/marketplace.json` lists them.
@@ -10,6 +12,7 @@ A Claude Code plugin marketplace named `production-ai`. Each top-level folder wi
 |---|---|---|
 | `rebuild-factory` | Audits an existing codebase, plans a rebuild, and runs it as a loop in which a separate coding agent builds and every session is reviewed from a clean clone | `rebuild-factory/README.md`, then `rebuild-factory/references/` |
 | `transcribe` | Local speech-to-text for a file or a URL | `transcribe/README.md` |
+| `change-factory` | Runs a list of changes to a working system as parallel workstreams built by OpenCode workers, reviewed, tested, merged and red-teamed, with deploys and owner decisions left to the owner | `change-factory/README.md`, then `change-factory/references/method.md` |
 | `expertise-miner` | Pulls YouTube transcripts into a searchable corpus and mines them for an expert's questions, rules of thumb and research steps, with every quote checked against the transcript | `expertise-miner/README.md`, then `expertise-miner/server/` |
 
 If you were asked to **install** a plugin for someone, read `INSTALL.md`. If you were asked to **use** one, read `llms.txt` and that plugin's README. The rest of this file is for changing the repository.
@@ -31,33 +34,42 @@ Inside a skill or an agent file, refer to the plugin's own files as `${CLAUDE_PL
 
 ## Before you commit
 
-Run all of these from the repository root. Every one must pass.
+This is the one list of commands to run before a commit or a pull request; `CONTRIBUTING.md` and `PLAYBOOK.md` point here. Run all of them from the repository root. Every one must pass. They need Node 20 or later, git 2.38 or later, Python 3.9 or later, the `claude` CLI, and OpenCode 2 for a few rebuild-factory checks.
 
 ```
 node .github/check.mjs
 claude plugin validate .
 claude plugin validate ./<each plugin folder>
 node rebuild-factory/tests/test_factory.mjs
+node core/sync.mjs --check
+node core/tests/test_core.mjs
+node change-factory/tests/test_cf.mjs
 python expertise-miner/tests/test_miner.py
 ```
 
-- `check.mjs` verifies the manifests, the skill and agent front matter, that every `${CLAUDE_PLUGIN_ROOT}` path exists, that every script parses, and that no machine path or secret-shaped string is committed. CI runs it and compiles the Python scripts.
+Then read `git status --short` and `git diff --stat`: they cannot fail, so look. Only the files of the one plugin you are committing (or of `core/` and its carriers), and nothing untracked that should ship.
+
+- Shared code (`core/`) is edited in `core/` only; `node core/sync.mjs` copies it into each plugin that carries it. A change there changes every carrier: bump each one's version and run its tests. How such a change is committed: rule 5.
+- `check.mjs` verifies the manifests, the skill and agent front matter, that every `${CLAUDE_PLUGIN_ROOT}` path exists, that every script parses, that `core/sync.mjs --check` passes, and that no machine path or secret-shaped string is committed. CI runs it, compiles the Python, runs the sync check and the core, change-factory and expertise-miner tests. CI does not run `claude plugin validate` or the rebuild-factory tests: run those yourself.
 - `test_factory.mjs` uses a stand-in for OpenCode, calls no model and spends nothing. A few of its checks need git and OpenCode 2 installed.
+- `test_core.mjs` and `test_cf.mjs` use stand-ins for OpenCode and for the test command, call no model and spend nothing. They need Node 20 and git 2.38 or later.
 - `test_miner.py` uses the standard library only (`python3` where `python` is not on the path). Listing, transcript fetching and the embeddings endpoint are replaced by stand-ins: it contacts nothing and needs no package installed. Never make a test of `expertise-miner` send a real request.
 - `transcribe` has no committed tests. If you change `transcribe.py`, test it with a stand-in for the speech model; do not load a model in an automated check.
 
 ## Rules that must not be broken
 
-1. **Nothing specific to one project, person or machine.** No drive paths, user names, product names, real findings, real plans. Method goes in a plugin's `references/`; a project's content stays in that project.
+1. **Nothing specific to one project, person or machine.** No drive paths, user names, product names, real findings, real plans. Method goes in a plugin's `references/`; a project's content stays in that project. A lesson about method, with the project, dates, numbers and people taken out, is allowed; a project's finding is not. Plans, reviews, fixes files and proof scripts live outside this repository.
 2. **No statement about safety that is not true as written.** If a protection stops only the plain form of something, say so. If a check detects and does not prevent, say that. Each claim in a README, a guide or `SECURITY.md` must match what the code does; when you change one, change the other in the same commit.
 3. **Never make the bridge or the helper script fail open.** In `rebuild-factory`, an unattended builder must not be startable without a rules file, and a plan folder must not be believed without the owner's acceptance. A change that adds a way round either is a defect, whatever else it fixes.
 4. **A plugin is published only after an independent review has approved it.** A reviewer that did not write the change reads the files, tries to break them, and says approve. Fix, and have the same reviewer check again, until it does. Do not add a plugin to `marketplace.json` before that.
-5. **One plugin per commit and per push** when publishing, so that each can be traced to its review.
+5. **One plugin per commit and per push** when publishing, so that each can be traced to its review. The one exception is a change to `core/`: `sync.mjs --check` fails unless every carrier's copy is in the same commit, so it is one commit holding `core/`, every carrier's copy and every carrier's version bump, named `core: ...`. A new carrier is added in its own commit that adds its folder and its line in `core/consumers.json` together.
 6. **Do not run a real builder, spend money or load a large model in a test.** Use a stub.
 7. **Never weaken the quote check or the politeness limits of `expertise-miner`.** An item reaches the output only when its quote is found in the stored transcript; workers never exceed distinct routes, and no route is ever used by two workers at once; the delay has a floor, whatever the settings say; a job-wide request limit, when set, holds across all workers; a run of refusals on a route, or too large a share of its recent videos refused, takes that route out of the pull, and when every route is out the pull stops; a route the site refused is held back from new pulls for a while; only YouTube addresses built from a parsed id reach the downloader; `proxy_test` sends one fixed request through each configured proxy route and nothing from the person's own address, and `setup_check` contacts nothing; configured credentials are filtered from every log line, job record and tool result the code writes; `mine_build` never believes `verified.jsonl` without checking it again. The embeddings address comes from the owner's settings only, never from a tool call or stored text; nothing is sent to it unless it is set; redirects from it are not followed; vectors made by two models are never mixed; the set-up tool takes no address, key or password, never overwrites a settings file, and writes nothing that switches on a connection. A change that adds a way round any of these is a defect.
 8. **Bump the plugin's `version`** in its `plugin.json` when its behaviour changes.
 
 ## Adding a plugin
+
+Follow `PLAYBOOK.md`; in short:
 
 1. Put its folder at the top level, with the layout above and a README written for someone who has never seen it.
 2. Have it reviewed (rule 4).

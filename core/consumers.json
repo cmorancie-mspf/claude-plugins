@@ -1,0 +1,4 @@
+{
+  "rebuild-factory": ["bridge"],
+  "change-factory": ["bridge", "lib"]
+}
