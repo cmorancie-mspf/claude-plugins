@@ -41,8 +41,8 @@ import store as store_mod  # noqa: E402
 HEARTBEAT_S = 10
 STALE_AFTER_S = 90
 BLOCK_STREAK = 5          # videos in a row, on one route, that got no answer: the route is taken out
-RATE_WINDOW = 10          # ...or among a route's last RATE_WINDOW videos, at least RATE_MIN got no answer
-RATE_MIN = 3              # and they are more than RATE_SHARE of those videos (3 of 9 or fewer, or 4 of 10)
+RATE_WINDOW = 10          # ...or among a route's last RATE_WINDOW videos, at least one answered, RATE_MIN got
+RATE_MIN = 3              # no answer and they are more than RATE_SHARE of them (3 of 9 or fewer, or 4 of 10)
 RATE_SHARE = 0.3
 ROTATE_EVERY = 20         # with routes standing by, a worker hands its route back after this many videos
 COOLDOWN_S = 1800         # after a job ends blocked, no new pull over the same routes for this long
@@ -870,15 +870,17 @@ def select_videos(job: dict, listed: list) -> list:
     return list(listed[: job["max_videos"]] if job["max_videos"] else listed)
 
 
-TAKE_OUT_RULE = (f"{BLOCK_STREAK} videos in a row, or at least {RATE_MIN} of its last {RATE_WINDOW} videos and more "
-                 f"than {int(RATE_SHARE * 100)}% of them")
+TAKE_OUT_RULE = (f"{BLOCK_STREAK} videos in a row, or, with answers in between, at least {RATE_MIN} of its last "
+                 f"{RATE_WINDOW} videos and more than {int(RATE_SHARE * 100)}% of them")
 
 
 def take_out_rule(window: list) -> str:
     """Why a route's recent videos take it out, or '' when they do not. `window` holds its last
     RATE_WINDOW videos, oldest first, each True when the video got no answer (the outcomes the
-    streak counts). Out after BLOCK_STREAK in a row, or when at least RATE_MIN got no answer and
-    they are more than RATE_SHARE of the window: 3 of 9 or fewer, or 4 of 10."""
+    streak counts). Out after BLOCK_STREAK in a row, or, when the window holds at least one
+    answered video (a route refused part of the time), when at least RATE_MIN got no answer and
+    they are more than RATE_SHARE of the window: 3 of 9 or fewer, or 4 of 10. A route that has
+    never answered within its window is judged by the streak alone."""
     window = list(window)[-RATE_WINDOW:]
     streak = 0
     for refused in reversed(window):
@@ -888,7 +890,7 @@ def take_out_rule(window: list) -> str:
     if streak >= BLOCK_STREAK:
         return f"{streak} videos in a row got no answer over it"
     k = sum(1 for refused in window if refused)
-    if k >= RATE_MIN and k > RATE_SHARE * len(window):
+    if k < len(window) and k >= RATE_MIN and k > RATE_SHARE * len(window):
         return f"refused {k} of its last {len(window)}"
     return ""
 
@@ -1053,8 +1055,8 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
         halt = {"state": "", "message": ""}
         # Routes: each worker holds one, and no route is ever held by two workers at once. Routes
         # beyond the number of workers stand by. A route is taken out for the rest of the job when
-        # BLOCK_STREAK videos in a row got no answer over it, or when at least RATE_MIN of its last
-        # RATE_WINDOW videos did and they are more than RATE_SHARE of them (take_out_rule); a
+        # BLOCK_STREAK videos in a row got no answer over it, or when, with at least one answered,
+        # RATE_MIN of its last RATE_WINDOW videos did and they are more than RATE_SHARE of them (take_out_rule); a
         # standby route, if any is left, takes its worker over. The job ends blocked only when every
         # route is out. While routes stand by, a worker hands its route back to the end of the
         # standby list every ROTATE_EVERY videos it handles and takes the next standby route, so

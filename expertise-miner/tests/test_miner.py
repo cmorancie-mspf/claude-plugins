@@ -37,9 +37,6 @@ SEGS = [[0.0, "welcome back everybody"], [4.0, "the first thing I always check"]
         [8.5, "is how many minutes a player got"], [12.0, "over the last five games, not the season"],
         [17.0, "because the season number hides a role change"], [65.0, "second point: never trust"],
         [69.0, "a single big game without checking the opponent"]]
-# A route that never answers is taken out at its RATE_MIN-th video, by the share rule (3 of 3), before
-# a run of BLOCK_STREAK can form (0.3.4). Once its window is full, the 4th refusal in a row does it.
-OUT_AFTER = pull.RATE_MIN
 
 
 class Base(unittest.TestCase):
@@ -519,7 +516,7 @@ class PullTests(Base):
         ids = [f"{i:011d}" for i in range(40)]
         job = self.run_job(self.job(), ids, fetcher)
         self.assertEqual(job["state"], "blocked")
-        self.assertEqual(len(asked), OUT_AFTER)                        # it did not keep asking
+        self.assertEqual(len(asked), pull.BLOCK_STREAK)                # it did not keep asking
         self.assertIn("resume", job["message"])
 
     def test_stop_request_ends_the_job_and_selection_respects_limits(self):
@@ -577,7 +574,7 @@ class PullTests(Base):
 
         job = self.run_job(self.job(details=False), [f"{i:011d}" for i in range(40)], fetcher)
         self.assertEqual(job["state"], "blocked")
-        self.assertEqual(len(asked), OUT_AFTER * 3)                    # three tries each, three videos, then stop
+        self.assertEqual(len(asked), pull.BLOCK_STREAK * 3)            # three tries each, five videos, then stop
 
     def test_unreadable_pages_under_min_views_stop_the_job(self):
         job = self.run_job(self.job(min_views=100), [VID_C] + [f"{i:011d}" for i in range(30)],
@@ -587,7 +584,7 @@ class PullTests(Base):
         pull.run_job(self.job(min_views=1), lister=self.lister([f"{i:011d}" for i in range(30)]),
                      fetcher=None, detailer=lambda vid, proxy: None, sleep=lambda s: None)
         last = pull.list_jobs(1)[0]
-        self.assertEqual((last["state"], last["counts"]["failed"]), ("blocked", OUT_AFTER))
+        self.assertEqual((last["state"], last["counts"]["failed"]), ("blocked", pull.BLOCK_STREAK))
 
     def test_a_refused_route_is_taken_out_and_the_others_finish_the_pull(self):
         # 0.3.2, on the owner's instruction: one refused route no longer stops the pull. It is taken
@@ -622,8 +619,8 @@ class PullTests(Base):
             job = self.run_job(jid, [f"{i:011d}" for i in range(60)], fetcher)
         self.assertIn("route bad.example:2 taken out", printed.getvalue())
         self.assertEqual((job["workers"], job["state"]), (3, "done"))
-        self.assertEqual(seen["bad"], OUT_AFTER)               # it was not asked again after it was out
-        self.assertEqual(job["counts"]["stored"], 60 - OUT_AFTER, (job["counts"], job["failure_reasons"]))
+        self.assertEqual(seen["bad"], pull.BLOCK_STREAK)               # it was not asked again after it was out
+        self.assertEqual(job["counts"]["stored"], 60 - pull.BLOCK_STREAK, (job["counts"], job["failure_reasons"]))
         self.assertEqual(top["max"], 1)
         self.assertEqual(job["routes_out"], ["bad.example:2"])
         self.assertIn("bad.example:2", job["message"])
@@ -856,7 +853,7 @@ class FieldReportTests(Base):
         with contextlib.redirect_stdout(io.StringIO()):
             done = pull.run_job(job["id"], lister=lister, fetcher=fetcher, detailer=None, sleep=lambda s: None)
         self.assertEqual(done["state"], "blocked")
-        self.assertEqual(done["failure_reasons"], {"ProxyLoginRefused": 2 * OUT_AFTER})
+        self.assertEqual(done["failure_reasons"], {"ProxyLoginRefused": 2 * pull.BLOCK_STREAK})
         self.assertIn("refused the user name or password", done["message"])
         self.assertEqual(pull.cooling_routes(), {})                   # the site did nothing: no cool-down
         self.assertNotIn("badpw123", json.dumps(done))
@@ -892,13 +889,13 @@ class FieldReportTests(Base):
         self.assertEqual(done["state"], "done")
         self.assertEqual(done["routes_out"], ["a.example:1"])
         self.assertIn("c.example:3", used)                             # the standby was used
-        self.assertEqual(used.count("a.example:1"), OUT_AFTER)
-        self.assertEqual(done["counts"]["stored"], 40 - OUT_AFTER)
+        self.assertEqual(used.count("a.example:1"), pull.BLOCK_STREAK)
+        self.assertEqual(done["counts"]["stored"], 40 - pull.BLOCK_STREAK)
 
     def test_only_when_every_route_is_out_does_the_pull_end_blocked(self):
         done, used = self.run_routes(["http://a.example:1", "http://b.example:2"], bad=["example"])
         self.assertEqual(done["state"], "blocked")
-        self.assertEqual(len(used), 2 * OUT_AFTER)
+        self.assertEqual(len(used), 2 * pull.BLOCK_STREAK)
         self.assertEqual(sorted(done["routes_out"]), ["a.example:1", "b.example:2"])
         for r in ("a.example:1", "b.example:2"):
             self.assertIn(r, done["message"])
@@ -935,7 +932,7 @@ class FieldReportTests(Base):
                 time.sleep(0.003)
                 return {"segments": SEGS, "language": "en", "is_generated": True}
             calls["n"] += 1
-            if calls["n"] < 2:            # the site refuses once, then the proxy fails
+            if calls["n"] < pull.BLOCK_STREAK:
                 raise RequestBlocked()
             raise ProxyError("Unable to connect to proxy: Tunnel connection failed: 502")
 
@@ -946,7 +943,7 @@ class FieldReportTests(Base):
                                 fetcher=fetcher, detailer=None, sleep=lambda s: None)
         self.assertEqual(done["routes_out"], ["a.example:1"])
         self.assertIn("a.example:1", pull.cooling_routes())           # four site refusals: cooled, whatever came last
-        self.assertIn("a.example:1 (RequestBlocked; refused 3 of its last 3)", done["message"])
+        self.assertIn("a.example:1 (RequestBlocked; 5 videos in a row got no answer over it)", done["message"])
         self.assertIn("pull_resume tries them again", done["message"])
 
     def test_words_that_only_look_like_a_proxy_failure_do_not_blame_it(self):
@@ -1011,7 +1008,7 @@ class FieldReportTests(Base):
                                 sleep=lambda s: None)
         self.assertEqual(done["state"], "blocked")
         self.assertIn("set a proxy", done["message"])
-        self.assertEqual(done["counts"]["failed"], OUT_AFTER)
+        self.assertEqual(done["counts"]["failed"], pull.BLOCK_STREAK)
 
     # ---- issue 10: the pull rate in the settings -----------------------------------------
 
@@ -1290,9 +1287,9 @@ class Phase2Tests(Base):
                                  fetcher=fetcher)
         self.assertEqual((done["workers"], done["state"]), (1, "done"))
         self.assertEqual(done["routes_out"], ["a.example:1"])
-        self.assertEqual(used[:OUT_AFTER], ["a.example:1"] * OUT_AFTER)
-        self.assertEqual(set(used[OUT_AFTER:]), {"b.example:2"})                  # route 2 finished the pull
-        self.assertEqual(done["counts"]["stored"], 20 - OUT_AFTER)
+        self.assertEqual(used[:pull.BLOCK_STREAK], ["a.example:1"] * pull.BLOCK_STREAK)
+        self.assertEqual(set(used[pull.BLOCK_STREAK:]), {"b.example:2"})                  # route 2 finished the pull
+        self.assertEqual(done["counts"]["stored"], 20 - pull.BLOCK_STREAK)
         self.assertIn("route a.example:1 taken out", printed)                    # the log names the switch
         self.assertIn("b.example:2 takes over", printed)
 
@@ -1759,7 +1756,10 @@ class Phase3Tests(Base):
         x, o = True, False
         self.assertEqual(pull.take_out_rule([o, o, x] * 3), "refused 3 of its last 9")
         self.assertEqual(pull.take_out_rule([o, o, x] * 2), "")                    # 2 is never enough
-        self.assertEqual(pull.take_out_rule([x, x, x]), "refused 3 of its last 3")
+        self.assertEqual(pull.take_out_rule([x, x, x]), "")                       # nothing answered: the streak
+        self.assertEqual(pull.take_out_rule([x] * 4), "")                         # judges it alone
+        self.assertEqual(pull.take_out_rule([x] * 5), "5 videos in a row got no answer over it")
+        self.assertEqual(pull.take_out_rule([o] + [x] * 3), "refused 3 of its last 4")
         self.assertEqual(pull.take_out_rule([o] * 7 + [x] * 3), "")                # 3 of 10 is 30%: not more
         self.assertEqual(pull.take_out_rule([o] * 6 + [x] * 4), "refused 4 of its last 10")
         self.assertEqual(pull.take_out_rule([x] * 3 + [o] * 10), "")              # only the last 10 count
@@ -1793,6 +1793,41 @@ class Phase3Tests(Base):
         self.assertEqual(done["routes_out_why"], {"a.example:1": "refused 3 of its last 9 (RequestBlocked)"})
         self.assertIn("a.example:1", pull.cooling_routes())                    # cooled, as after a run
         self.assertEqual(done["refusals_by_route"], {})                         # the three took it out
+
+    def test_four_refusals_in_a_row_with_nothing_answered_leave_a_route_in_and_the_fifth_takes_it_out(self):
+        os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
+        used = []
+
+        def fetcher(vid, langs, proxy):
+            used.append(config.mask_proxy(proxy))
+            if "a.example" in proxy:
+                raise self.RequestBlocked()
+            return self.ok()
+
+        for n_ids, state, out in ((4, "done", []), (12, "done", ["a.example:1"])):
+            used.clear()
+            done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "workers": 1, "details": False,
+                                      "max_videos": 0},
+                                     lister=PullTests.lister([f"r{n_ids}{i:08d}x" for i in range(n_ids)]),
+                                     fetcher=fetcher)
+            self.assertEqual((done["state"], done["routes_out"]), (state, out), n_ids)
+        # 4 videos, all refused, and none answered: still in (the streak is 5), and they are counted
+        # 12 videos: out on the 5th, b finishes
+        self.assertEqual(used[:5], ["a.example:1"] * 5)
+        self.assertEqual(set(used[5:]), {"b.example:2"})
+        self.assertEqual(done["routes_out_why"], {"a.example:1": "5 videos in a row got no answer over it (RequestBlocked)"})
+
+    def test_with_no_proxy_a_pull_still_ends_blocked_after_five(self):
+        used = []
+
+        def fetcher(vid, langs, proxy):
+            used.append(vid)
+            raise self.RequestBlocked()
+
+        done, _ = self.pull_with({"kind": "channel", "target": "@SomeExpert", "details": False, "max_videos": 0},
+                                 lister=PullTests.lister([f"{i:011d}" for i in range(20)]), fetcher=fetcher)
+        self.assertEqual((done["state"], len(used), done["counts"]["failed"]), ("blocked", 5, 5))
+        self.assertIn("5 videos in a row got no answer over it", done["message"])
 
     def test_a_route_out_by_the_share_rule_is_not_cooled_when_only_the_proxy_failed(self):
         os.environ["PROXY_URLS"] = "http://a.example:1,http://b.example:2"
